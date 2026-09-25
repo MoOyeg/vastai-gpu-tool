@@ -159,11 +159,19 @@ def test_minimax_keeps_its_mandatory_block_size():
 
 
 def test_json_chat_template_kwargs_survive_shell_quoting():
-    """The JSON must reach vllm as one argument, not get split by bash."""
-    for key in ("qwen3.8-27b", "deepseek-v4.1-flash-max"):
-        onstart = provision.build_onstart(recipes.get(key), port=8000)
-        assert "--default-chat-template-kwargs '{" in onstart, key
-        assert onstart.count("'") % 2 == 0, f"{key}: unbalanced quotes"
+    """Where a recipe pins chat-template kwargs, the JSON must reach vllm as one
+    argument rather than being split by bash."""
+    onstart = provision.build_onstart(recipes.get("deepseek-v4.1-flash-max"), port=8000)
+    assert "--default-chat-template-kwargs '{" in onstart
+    assert '"reasoning_effort":100' in onstart
+
+
+def test_every_onstart_has_balanced_quotes():
+    """An unbalanced quote would silently swallow the rest of the command."""
+    for key, r in recipes.all_recipes().items():
+        onstart = provision.build_onstart(r, port=8000)
+        assert onstart.count("'") % 2 == 0, f"{key}: unbalanced single quotes"
+        assert onstart.count('"') % 2 == 0, f"{key}: unbalanced double quotes"
 
 
 def test_unknown_recipe_lists_alternatives():

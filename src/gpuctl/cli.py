@@ -299,6 +299,7 @@ def launch(
     watch_after: bool = typer.Option(True, "--watch/--no-watch"),
     set_default: bool = typer.Option(False, "--set-default"),
     conductor: bool = typer.Option(False, "--conductor", help="also set Conductor's default model once serving"),
+    on_stall: str = typer.Option("warn", "--on-stall", help="what to do if it hangs: warn | destroy"),
 ) -> None:
     """Launch any catalogue model on the cheapest hardware that fits it."""
     try:
@@ -349,7 +350,7 @@ def launch(
     state.save(dep)
     console.print(f"[green]rented[/] instance [bold]{dep.instance_id}[/] at {_money(dep.dph_at_launch)}/hr")
     if watch_after:
-        _watch_loop(dep, interval=10.0, set_default=set_default, reap=True, conductor=conductor)
+        _watch_loop(dep, interval=10.0, set_default=set_default, reap=True, conductor=conductor, on_stall=on_stall)
     else:
         console.print(f"[dim]track it with:[/] gpuctl watch {dep.instance_id}")
 
@@ -470,6 +471,7 @@ def up(
     watch_after: bool = typer.Option(True, "--watch/--no-watch", help="track until it is serving"),
     set_default: bool = typer.Option(False, "--set-default", help="make this opencode's default model"),
     conductor: bool = typer.Option(False, "--conductor", help="also set Conductor's default model once serving"),
+    on_stall: str = typer.Option("warn", "--on-stall", help="what to do if it hangs: warn | destroy"),
 ) -> None:
     """Rent a GPU box and start vLLM on it."""
     try:
@@ -543,7 +545,7 @@ def up(
         console.print(f"[dim]auto-destroy deadline: {time.strftime('%H:%M:%S', time.localtime(dep.deadline))}[/]")
 
     if watch_after:
-        _watch_loop(dep, interval=10.0, set_default=set_default, reap=True, conductor=conductor)
+        _watch_loop(dep, interval=10.0, set_default=set_default, reap=True, conductor=conductor, on_stall=on_stall)
     else:
         console.print(f"[dim]track it with:[/] gpuctl watch {dep.instance_id}")
 
@@ -598,9 +600,20 @@ def ps(
     total = sum(s.cost for s in snaps if not s.dep.destroyed_at)
     console.print(f"[dim]live spend so far: [/][bold]{_money(total)}[/]")
 
+    wasted = [s for s in snaps if s.phase.wasting_money and not s.dep.destroyed_at]
+    if wasted:
+        burn = sum(s.dep.dph_at_launch for s in wasted)
+        ids = ", ".join(str(s.dep.instance_id) for s in wasted)
+        console.print(
+            f"\n[bold red]{len(wasted)} deployment(s) billing with no prospect of serving[/] "
+            f"({ids}) — burning [bold]{_money(burn)}/hr[/]."
+        )
+        console.print("[dim]`gpuctl logs <id>` to see why · `gpuctl down <id>` to stop it · "
+                      "`gpuctl reap --stalled` for all of them[/]")
+
 
 def _watch_loop(dep: Deployment, *, interval: float, set_default: bool, reap: bool,
-                conductor: bool = False) -> None:
+                conductor: bool = False, on_stall: str = "warn") -> None:
     """Poll until the box is serving, then wire it into opencode."""
     config_path = opencode.target_path()
     linked = False
@@ -636,6 +649,22 @@ def _watch_loop(dep: Deployment, *, interval: float, set_default: bool, reap: bo
                     _apply_conductor(state.find(dep.instance_id) or fresh)
                 break
 
+            if snap.phase is Phase.STALLED:
+                console.print(
+                    f"[bold red]stalled[/] — instance {dep.instance_id} has shown no sign of "
+                    f"progress for {snap.stalled_for / 60:.0f} minutes while billing "
+                    f"{_money(fresh.dph_at_launch)}/hr."
+                )
+                console.print(f"[dim]spent so far: {_money(snap.cost)} · "
+                              f"inspect with `gpuctl logs {dep.instance_id}`[/]")
+                if on_stall == "destroy":
+                    console.print("[yellow]--on-stall destroy:[/] destroying it now.")
+                    _destroy(c, fresh)
+                else:
+                    console.print(f"[dim]`gpuctl down {dep.instance_id}` to stop the meter, "
+                                  f"or re-run watch to keep waiting.[/]")
+                break
+
             if snap.phase in (Phase.ERROR, Phase.STOPPED, Phase.GONE):
                 console.print(f"[bold red]{snap.phase.value}[/]: {snap.detail or snap.status_msg}")
                 console.print(f"[dim]logs:[/] gpuctl logs {dep.instance_id}")
@@ -669,10 +698,11 @@ def watch(
     set_default: bool = typer.Option(False, "--set-default"),
     reap: bool = typer.Option(True, "--reap/--no-reap", help="auto-destroy at the TTL deadline"),
     conductor: bool = typer.Option(False, "--conductor", help="also set Conductor's default model once serving"),
+    on_stall: str = typer.Option("warn", "--on-stall", help="what to do if it hangs: warn | destroy"),
 ) -> None:
     """Track a deployment until it serves, then configure opencode."""
     _watch_loop(_need(ref), interval=interval, set_default=set_default, reap=reap,
-                conductor=conductor)
+                conductor=conductor, on_stall=on_stall)
 
 
 # ------------------------------------------------------------- conductor
@@ -904,19 +934,30 @@ def down(
 @app.command()
 def reap(
     yes: bool = typer.Option(False, "--yes", "-y", help="destroy expired deployments without asking"),
+    stalled: bool = typer.Option(False, "--stalled", help="also destroy deployments that have hung"),
 ) -> None:
     """Destroy any tracked deployment past its TTL. Safe to run from cron."""
-    expired = [d for d in state.load_all() if d.expired()]
-    if not expired:
-        console.print("[dim]nothing expired.[/]")
+    targets: list[tuple[Deployment, str]] = [
+        (d, f"{_dur(time.time() - d.deadline)} past its TTL") for d in state.load_all() if d.expired()
+    ]
+    if stalled:
+        seen = {d.instance_id for d, _ in targets}
+        with _client() as c:
+            for dep in state.load_all():
+                if dep.instance_id in seen:
+                    continue
+                snap = snapshot(c, dep)
+                if snap.phase is Phase.STALLED:
+                    targets.append((dep, f"stalled for {snap.stalled_for / 60:.0f}m"))
+    if not targets:
+        console.print("[dim]nothing expired" + (" or stalled" if stalled else "") + ".[/]")
         return
-    for dep in expired:
-        over = _dur(time.time() - dep.deadline)
-        if not yes and not typer.confirm(f"{dep.instance_id} is {over} past its TTL. Destroy?", default=True):
+    for dep, why in targets:
+        if not yes and not typer.confirm(f"{dep.instance_id} is {why}. Destroy?", default=True):
             continue
         with _client() as c:
             _destroy(c, dep)
-        console.print(f"[green]reaped[/] {dep.instance_id} (~{_money(dep.accrued_cost())} spent)")
+        console.print(f"[green]reaped[/] {dep.instance_id} — {why} (~{_money(dep.accrued_cost())} spent)")
 
 
 # ------------------------------------------------------------------- bench

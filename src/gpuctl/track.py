@@ -17,6 +17,7 @@ class Phase(str, Enum):
     LOADING = "loading"       # Vast is pulling the image / starting the container
     RUNNING = "running"       # container up, vLLM still loading weights
     SERVING = "serving"       # /v1/models answers - the real readiness signal
+    STALLED = "stalled"       # container up but showing no sign of progress
     LINKED = "linked"         # written into opencode's config
     STOPPED = "stopped"
     ERROR = "error"
@@ -26,17 +27,68 @@ class Phase(str, Enum):
     def terminal(self) -> bool:
         return self in (Phase.LINKED, Phase.STOPPED, Phase.ERROR, Phase.GONE)
 
+    @property
+    def wasting_money(self) -> bool:
+        """Billing, but will not become useful without intervention."""
+        return self in (Phase.STALLED, Phase.ERROR)
+
 
 PHASE_STYLE = {
     Phase.PENDING: "dim",
     Phase.LOADING: "yellow",
     Phase.RUNNING: "cyan",
     Phase.SERVING: "green",
+    Phase.STALLED: "bold red",
     Phase.LINKED: "bold green",
     Phase.STOPPED: "dim red",
     Phase.ERROR: "bold red",
     Phase.GONE: "dim",
 }
+
+
+# How long a phase may show no observable progress before we call it stalled.
+# Image pulls are quiet for a while but Vast streams layer progress through
+# status_msg, so LOADING still moves; once the container is up, a healthy vLLM
+# is always doing something visible (downloading, loading, or capturing graphs).
+# Minimum gap between log fetches while a stall is suspected.
+LOG_CHECK_INTERVAL = 120.0
+
+STALL_AFTER = {
+    Phase.LOADING: 1800.0,   # 30 min
+    Phase.RUNNING: 600.0,    # 10 min
+    Phase.PENDING: 900.0,    # 15 min
+}
+
+
+def progress_marker(instance: dict[str, Any], phase: "Phase | None" = None) -> str:
+    """Fingerprint of the signals that reflect the *workload* progressing.
+
+    Deliberately excludes gpu_util, cpu_util and mem_usage. Vast caches that
+    telemetry and refreshes it on its own schedule, so those values change
+    merely because the host is alive — on a box observed genuinely hung, they
+    sat frozen for a minute and then jumped, which would read as progress and
+    reset the stall clock forever.
+
+    What is left is honest: actual_status and status_msg move while Vast is
+    pulling the image, and disk_usage grows while weights download. Once the
+    container is up and the model is cached, neither moves — so the container
+    log becomes the deciding signal (see _log_grew).
+    """
+    def num(key: str, places: int = 1) -> str:
+        try:
+            return f"{round(float(instance.get(key) or 0), places):.{places}f}"
+        except (TypeError, ValueError):
+            return "?"
+
+    parts = [str(instance.get("actual_status") or ""), num("disk_usage")]
+    # status_msg legitimately streams docker layer progress while the image is
+    # being pulled, so it is real progress during LOADING. Once the container is
+    # up it is a static banner that Vast nonetheless rewrites occasionally
+    # (observed flapping between ".../ssh" and "..."), which would reset the
+    # stall clock forever. Past LOADING, the log is the signal instead.
+    if phase in (None, Phase.PENDING, Phase.LOADING):
+        parts.append((str(instance.get("status_msg") or ""))[:200])
+    return "|".join(parts)
 
 
 @dataclass
@@ -48,6 +100,7 @@ class Snapshot:
     probe: Probe | None
     detail: str
     cost: float
+    stalled_for: float = 0.0   # seconds without observable progress
 
     @property
     def actual_status(self) -> str:
@@ -58,8 +111,89 @@ class Snapshot:
         return ((self.instance or {}).get("status_msg") or "").strip()
 
 
-def snapshot(client: VastClient, dep: Deployment, *, deep: bool = True) -> Snapshot:
-    """One observation of where a deployment actually is."""
+def snapshot(
+    client: VastClient,
+    dep: Deployment,
+    *,
+    deep: bool = True,
+    detect_stall: bool = True,
+    confirm_with_logs: bool = True,
+) -> Snapshot:
+    """Where a deployment is, with a stall check layered on top.
+
+    The raw observation cannot tell a slow box from a wedged one — that needs
+    two points in time. The progress marker is persisted on the deployment, so
+    consecutive runs of any command supply those points even when nothing is
+    actively watching.
+    """
+    snap = _observe(client, dep, deep=deep)
+    if not detect_stall:
+        return snap
+
+    limit = STALL_AFTER.get(snap.phase)
+    if limit is None or snap.instance is None:
+        return snap
+
+    marker = progress_marker(snap.instance, snap.phase)
+    now = time.time()
+    if marker != dep.progress_marker or not dep.progress_at:
+        # Something moved (or this is the first look): reset the clock.
+        dep.progress_marker = marker
+        dep.progress_at = now
+        save(dep)
+        return snap
+
+    stalled_for = now - dep.progress_at
+    snap.stalled_for = stalled_for
+
+    # Past the halfway mark, start checking the container log — the one signal a
+    # working vLLM always produces. Rate-limited so a tight `watch` loop does not
+    # pay for a log fetch on every poll.
+    if confirm_with_logs and stalled_for >= limit / 2:
+        if now - dep.log_checked_at >= LOG_CHECK_INTERVAL:
+            grew, size = _log_grew(client, dep)
+            dep.log_checked_at = now
+            if size:
+                dep.log_size = size
+            if grew:
+                dep.progress_at = now
+                snap.stalled_for = 0.0
+                save(dep)
+                return snap
+            save(dep)
+
+    if stalled_for < limit:
+        return snap
+
+    snap.phase = Phase.STALLED
+    mins = stalled_for / 60
+    detail = f"no progress for {mins:.0f}m"
+    if confirm_with_logs and dep.log_size:
+        detail += "; container log not growing either"
+    snap.detail = f"{detail} (was: {snap.detail})" if snap.detail else detail
+    return snap
+
+
+def _log_grew(client: VastClient, dep: Deployment) -> tuple[bool, int]:
+    """Has the container log grown since we last looked? (grew, current_size)."""
+    try:
+        text = client.logs(dep.instance_id, tail=2000)
+    except Exception:
+        # A log fetch failure is not evidence of progress.
+        return False, 0
+    size = len(text or "")
+    if not size:
+        return False, 0
+    if not dep.log_size:
+        # First measurement is a baseline, not evidence either way. Report no
+        # growth but let the caller store the size; the stall threshold has not
+        # necessarily elapsed yet, so this does not by itself condemn the box.
+        return False, size
+    return size > dep.log_size, size
+
+
+def _observe(client: VastClient, dep: Deployment, *, deep: bool = True) -> Snapshot:
+    """One raw observation of where a deployment actually is."""
     cost = dep.accrued_cost()
 
     if dep.destroyed_at:

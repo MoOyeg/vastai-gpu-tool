@@ -24,6 +24,50 @@ things:
 - **Teardown is symmetric.** `gpuctl down` destroys the instance *and* removes
   the provider block it added to opencode, so you never point opencode at a
   dead IP.
+- **A hang is detected, not waited out.** The expensive failure is a box that
+  wedges while nobody is watching — it bills at full rate and looks exactly
+  like one that is merely slow. See below.
+
+## Catching a hang
+
+A vLLM process can load its weights and then wedge: container `running`, Vast
+reporting `status_msg: "success"`, GPU idle, nothing bound to the port. Left
+alone it bills until the TTL. `gpuctl` calls this the **`stalled`** phase.
+
+```
+$ gpuctl ps
+│ 52523991 │ qwen3.8-27b │ 2x RTX 5090 │ stalled │ 1h15m │ $1.25 │ … │ no progress for 12m;
+│          │             │             │         │       │       │   │ container log not growing either
+
+1 deployment(s) billing with no prospect of serving (52523991) — burning $0.99/hr.
+`gpuctl logs <id>` to see why · `gpuctl down <id>` to stop it · `gpuctl reap --stalled` for all of them
+```
+
+Detection needs two points in time, so the progress marker is **persisted on
+the deployment** — consecutive runs of *any* command supply those points, which
+matters because the failure happens when no `watch` is running. `watch` stops on
+a stall rather than waiting forever (`--on-stall destroy` to tear down
+unattended), and `reap --stalled` is the cron-safe sweep.
+
+Two traps, both found against a genuinely hung instance rather than reasoned
+about:
+
+- **`gpu_util` / `cpu_util` / `mem_usage` are not progress.** Vast caches that
+  telemetry and refreshes it on its own schedule. On the hung box they sat
+  frozen for a minute and then jumped — counting that as progress resets the
+  stall clock forever. They are excluded from the marker. (Vast also reported
+  `gpu_util` 49% while `nvidia-smi` on the box said 0%.)
+- **`status_msg` is progress only while `loading`.** It streams real docker
+  layer progress during an image pull, but once running it is a static banner
+  that Vast occasionally rewrites (observed dropping a `/ssh` suffix). So it
+  counts during `loading` and is ignored afterwards.
+
+What is left — `actual_status`, `disk_usage`, and the **container log** — is
+honest. The log is the deciding signal once the container is up, since a working
+vLLM always writes to it. It is fetched only once a stall is already suspected
+(past half the threshold) and no more than every `LOG_CHECK_INTERVAL`, so a
+tight watch loop does not pay for it on every poll. A first log measurement is
+treated as a baseline, never as evidence.
 
 ## Install
 

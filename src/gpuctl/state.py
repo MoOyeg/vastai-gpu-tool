@@ -33,6 +33,13 @@ class Deployment:
     label: str = ""
     opencode_provider: str = ""
     opencode_target: str = ""
+    # Last observed sign of forward progress, and when we saw it. Persisted so
+    # any command (ps, watch, reap) can spot a stall — the failure mode that
+    # matters most is a box that hangs while nobody is watching.
+    progress_marker: str = ""
+    progress_at: float = 0.0
+    log_size: int = 0          # last observed container-log length
+    log_checked_at: float = 0.0  # when we last paid for a log fetch
     conductor_target: str = ""
     # [models] keys we overwrote, and their prior values (None = key was absent).
     conductor_prev: dict[str, Any] = field(default_factory=dict)

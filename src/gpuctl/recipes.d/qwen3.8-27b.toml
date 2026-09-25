@@ -1,22 +1,27 @@
-# Qwen3.8 27B (xhigh) — the only one of this set that is cheap to host.
+# Qwen3.8 27B (xhigh) — single-GPU, TP=1.
 # Flags from the official vLLM recipe: https://recipes.vllm.ai/Qwen/Qwen3.8-27B
-title = "Qwen3.8 27B (xhigh) — dense, FP8"
-gpu_name = "RTX 5090"
-num_gpus = 2
+#
+# An earlier version of this recipe ran FP8 at TP=2 on 2x RTX 5090 and hung
+# reproducibly (three instances, ~$5): vLLM 0.30.0 completed the multi-modal
+# warmup and then wedged before starting the API server — CPU time frozen,
+# GPU idle, nothing bound to :8000. TP=2 is not a layout the upstream recipe
+# covers (it documents TP=1 for NVFP4 and TP=4 for FP8), so this now uses a
+# single 96 GiB card and no tensor parallelism at all.
+title = "Qwen3.8 27B (xhigh) — 1x 96 GiB, TP=1"
+gpu_name = "RTX PRO 6000 WS"
+num_gpus = 1
 model = "Qwen/Qwen3.8-27B-FP8"
 tool_parser = "qwen3_xml"
 disk_gb = 90
-max_dph = 2.20
+max_dph = 2.00
 min_inet_down = 500
 min_cuda = 13.0
-est_tokps = "~55-80"
+est_tokps = "?"
 doc_ref = "METHOD §7"
-notes = "FP8 weights are 30.9 GB; 64 layers x 4 KV heads x head_dim 256 = 256 KiB/token at fp16, so fp8 KV is what makes long context affordable. reasoning_effort xhigh is Qwen3.8's own default; it is pinned here so the setting is explicit and reproducible."
+notes = "Qwen3.8 is a vision-language model (Qwen3VL) and runs a multi-modal warmup before serving, so first start is slow — do not mistake it for a hang, and do check `gpuctl ps` for the stalled phase if it exceeds ~10 min. reasoning_effort xhigh is already Qwen3.8's own default; --default-chat-template-kwargs is deliberately NOT set here because it was the first thing suspected in the TP=2 hang and pinning a default buys nothing. Cheaper alternative: Inferact/Qwen3.8-27B-NVFP4 is 24.6 GiB and fits one RTX 5090 (~$0.51/hr), but leaves only ~3 GiB for KV, so cap --max-model-len near 16384."
 vllm_args = [
-  "--tensor-parallel-size", "2",
   "--max-model-len", "131072",
   "--kv-cache-dtype", "fp8",
   "--gpu-memory-utilization", "0.92",
   "--reasoning-parser", "qwen3",
-  "--default-chat-template-kwargs", "'{\"reasoning_effort\":\"xhigh\"}'",
 ]
