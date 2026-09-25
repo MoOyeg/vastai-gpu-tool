@@ -377,9 +377,28 @@ uv run gpuctl conductor set --review        # also set the code-review model
 uv run gpuctl conductor revert              # put back what was there before
 ```
 
-`--conductor` also works on `up`, `watch` and `link`. `gpuctl down` reverts
-automatically, so Conductor is never left pointing at a destroyed instance —
-and `gpuctl conductor` flags it loudly if something else left it that way.
+`--conductor` sets **both** defaults: opencode's own `model` and Conductor's
+`models.default`. Conductor delegates model choice to opencode, so setting only
+the latter leaves opencode still configured for whatever it was on before.
+
+It also works on `up`, `watch` and `link`. `gpuctl down` reverts automatically —
+restoring *your* original model, not an earlier one of ours — so Conductor is
+never left pointing at a destroyed instance, and `gpuctl conductor` flags it
+loudly if something else left it that way.
+
+**If the model still does not appear in Conductor's picker**, that is a separate
+thing and not something gpuctl can set. Conductor's picker is driven by its own
+favourites list, held in `~/Library/Application Support/com.conductor.app/conductor.db`:
+
+```
+favorite_models.configuration = {"type":"built-in","agent":"codex","model":"gpt-5.6-sol",…}
+```
+
+`models.default` in `settings.toml` chooses the model for *new chats*; it does
+not add an entry to that list. Add the OpenCode model once in Conductor's UI
+(Settings → Harnesses → OpenCode) and it will appear thereafter. gpuctl
+deliberately does not write to that database — it belongs to a running app and
+carries org/user ids that look server-synced.
 
 The written value is the provider-qualified id Conductor expects, which is the
 same one opencode uses:

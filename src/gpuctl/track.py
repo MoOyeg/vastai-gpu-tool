@@ -342,6 +342,28 @@ def link_opencode(
     return result
 
 
+def set_opencode_default(dep: Deployment) -> tuple[str, str | None]:
+    """Make this deployment opencode's default model. Returns (ref, previous)."""
+    from pathlib import Path as _Path
+
+    from . import opencode
+
+    if not (dep.linked_at and dep.opencode_provider and dep.opencode_target):
+        raise RuntimeError(
+            f"instance {dep.instance_id} is not linked into opencode yet; "
+            f"run `gpuctl link {dep.instance_id}` first."
+        )
+    model_id = dep.notes.get("linked_model_id") or dep.served_name
+    ref = f"{dep.opencode_provider}/{model_id}"
+    previous, _ = opencode.set_default_model(path=_Path(dep.opencode_target), model_ref=ref)
+    # Keep the first-seen previous value so teardown restores the user's own
+    # choice rather than one of ours.
+    if previous and not previous.startswith(f"{dep.opencode_provider}/"):
+        dep.notes.setdefault("previous_default_model", previous)
+    save(dep)
+    return ref, previous
+
+
 def link_conductor(
     dep: Deployment,
     *,

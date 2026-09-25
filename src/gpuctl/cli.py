@@ -30,8 +30,8 @@ from .config import (
 from .health import completion_smoke
 from .state import Deployment
 from .track import (
-    PHASE_STYLE, Phase, link_conductor, link_opencode, snapshot,
-    unlink_conductor, unlink_opencode,
+    PHASE_STYLE, Phase, link_conductor, link_opencode, set_opencode_default,
+    snapshot, unlink_conductor, unlink_opencode,
 )
 from .recipes import BUILTIN_DIRNAME as BUILTIN_DIR
 from .vast import VastClient, VastError, normalize_gpu_name, ssh_target
@@ -881,6 +881,12 @@ def conductor_set(
     dep = _need(ref)
     target = Path(settings).expanduser() if settings else conductor_mod.SETTINGS_PATH
     try:
+        ref, previous = set_opencode_default(dep)
+        console.print(f"[green]set[/] opencode model = [bold]{ref}[/]"
+                      f"[dim]{f'  (was {previous})' if previous else ''}[/]")
+    except (opencode.OpencodeError, RuntimeError) as exc:
+        _fail(str(exc))
+    try:
         if create:
             target.parent.mkdir(parents=True, exist_ok=True)
         edit = link_conductor(dep, also_review=review, path=target)
@@ -1118,7 +1124,19 @@ def ledger(
 
 
 def _apply_conductor(dep: Deployment) -> None:
-    """Best-effort: a Conductor edit must never fail a launch."""
+    """Point both opencode and Conductor at this deployment.
+
+    Conductor delegates model choice to opencode, so setting only Conductor's
+    `models.default` leaves opencode itself still configured for whatever it was
+    on before. Both are set together.
+    """
+    try:
+        ref, previous = set_opencode_default(dep)
+    except (opencode.OpencodeError, RuntimeError) as exc:
+        err.print(f"[yellow]opencode default not set:[/] {exc}")
+    else:
+        console.print(f"[green]opencode default model[/] → [bold]{ref}[/]"
+                      f"[dim]  (was {previous or 'unset'})[/]")
     try:
         edit = link_conductor(dep)
     except (conductor_mod.ConductorError, RuntimeError) as exc:

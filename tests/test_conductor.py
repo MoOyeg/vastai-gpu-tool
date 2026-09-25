@@ -169,3 +169,77 @@ def test_unlink_clears_tracking(settings):
     after = state.find(7)
     assert after.conductor_target == "" and after.conductor_prev == {}
     assert track.unlink_conductor(after) == [], "second revert is a no-op"
+
+
+# --------------------------------------------- opencode default follows through
+
+
+@pytest.fixture
+def oc_config(tmp_path):
+    import json
+    p = tmp_path / "opencode.json"
+    p.write_text(json.dumps({
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {"omlx": {"name": "oMLX"}},
+        "model": "omlx/local-model",
+    }, indent=2))
+    return p
+
+
+def linked_dep(oc_path, **kw):
+    base = dict(instance_id=9, recipe="build-a", model="m/x", served_name="x",
+                offer_id=1, port=8000, serve_key="k", created_at=time.time(),
+                ttl_hours=3.0, dph_at_launch=1.0, gpu_label="1x RTX PRO 6000 WS",
+                opencode_provider="vast-9", opencode_target=str(oc_path),
+                linked_at=time.time(), notes={"linked_model_id": "Qwen3.8-27B-FP8"})
+    base.update(kw)
+    d = Deployment(**base)
+    state.save(d)
+    return d
+
+
+def read(p):
+    import json
+    return json.loads(p.read_text())
+
+
+def test_sets_opencode_default_model(oc_config):
+    """Conductor delegates model choice to opencode, so opencode's own default
+    must follow — otherwise it stays on whatever it was configured for before."""
+    ref, previous = track.set_opencode_default(linked_dep(oc_config))
+    assert ref == "vast-9/Qwen3.8-27B-FP8"
+    assert previous == "omlx/local-model"
+    assert read(oc_config)["model"] == "vast-9/Qwen3.8-27B-FP8"
+
+
+def test_provider_block_is_untouched_by_a_default_change(oc_config):
+    track.set_opencode_default(linked_dep(oc_config))
+    assert read(oc_config)["provider"]["omlx"] == {"name": "oMLX"}
+
+
+def test_previous_default_is_remembered_for_teardown(oc_config):
+    d = linked_dep(oc_config)
+    track.set_opencode_default(d)
+    assert state.find(9).notes["previous_default_model"] == "omlx/local-model"
+
+
+def test_repointing_does_not_overwrite_the_users_original(oc_config):
+    """Setting twice must still remember the user's model, not ours."""
+    d = linked_dep(oc_config)
+    track.set_opencode_default(d)
+    track.set_opencode_default(state.find(9))
+    assert state.find(9).notes["previous_default_model"] == "omlx/local-model"
+
+
+def test_requires_an_opencode_link_first(oc_config):
+    with pytest.raises(RuntimeError, match="not linked into opencode"):
+        track.set_opencode_default(linked_dep(oc_config, linked_at=None, opencode_provider=""))
+
+
+def test_setting_the_same_default_twice_is_a_noop(oc_config):
+    from gpuctl import opencode as oc
+    track.set_opencode_default(linked_dep(oc_config))
+    previous, backup = oc.set_default_model(path=oc_config,
+                                           model_ref="vast-9/Qwen3.8-27B-FP8")
+    assert previous == "vast-9/Qwen3.8-27B-FP8"
+    assert backup is None, "no backup churn when nothing changes"

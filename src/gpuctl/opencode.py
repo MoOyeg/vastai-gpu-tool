@@ -133,6 +133,23 @@ def link(
     return LinkResult(path, provider_id, backup, set_default, previous_default)
 
 
+def set_default_model(*, path: Path, model_ref: str) -> tuple[str | None, Path | None]:
+    """Point opencode's own `model` at `model_ref`. Returns (previous, backup).
+
+    Separate from `link` so the default can be changed without rewriting a
+    provider block — and so Conductor, which delegates to opencode, inherits the
+    same choice rather than opencode quietly staying on a different model.
+    """
+    data = _load(path)
+    backup = _backup(path)
+    previous = data.get("model") if isinstance(data.get("model"), str) else None
+    if previous == model_ref:
+        return previous, None
+    data["model"] = model_ref
+    _write(path, data)
+    return previous, backup
+
+
 def unlink(*, path: Path, provider_id: str, restore_model: str | None = None) -> bool:
     """Remove a provider we added. Returns True if something was removed."""
     if not path.exists():
