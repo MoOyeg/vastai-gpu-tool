@@ -152,6 +152,38 @@ uv run gpuctl down                    # stop the meter, unlink from opencode
 (respecting vLLM's TP divisibility rule), context from what the VRAM allows,
 disk from the weight size. `up <recipe>` still runs the fixed presets.
 
+### Choosing the host
+
+By default `up` and `launch` take the cheapest offer. `--choose` lists the
+cheapest few instead and lets you pick, with a warning column for the traps that
+have actually cost money here:
+
+```
+$ gpuctl up build-a --choose
+┃ # ┃ offer    ┃ gpu         ┃  $/hr ┃  $3h ┃  rel. ┃ net ↓ ┃ disk ┃ location   ┃ notes
+│ 1 │ 48372898 │ 2x RTX 3090 │ 0.324 │ 0.97 │ 99.3% │   731 │ 612G │ Hebei, CN  │ CN: HuggingFace often throttled
+│ 2 │ 11997120 │ 2x RTX 3090 │ 0.423 │ 1.27 │ 99.8% │   162 │ 533G │ Quebec, CA │ slow net 162Mbps (~33m pull); CUDA 12.2, no forward compat → error 804 risk
+│ 3 │ 44579222 │ 2x RTX 3090 │ 0.501 │ 1.50 │ 98.5% │   754 │ 294G │ California │
+```
+
+`--choices N` sets how many to list (default 5, max 10). The flags are:
+
+| flag | why it matters |
+|---|---|
+| `CN: HuggingFace often throttled` | the box must pull tens of GB from HF |
+| `slow net … (~Nm pull)` | download time estimated from the model's real weight size |
+| `reliability …%` | below 97% |
+| `CUDA …, no forward compat → error 804 risk` | a CUDA 13 image on an older driver, on a GPU that cannot use forward compatibility |
+
+That last one keys on the **product line, not `compute_cap`** — forward
+compatibility works on datacenter GPUs and not on GeForce or workstation parts,
+and `compute_cap` cannot express that (a GeForce 3090 reports 860 while a
+datacenter A100 reports 800).
+
+Cheapest is always `#1`, so the flag costs nothing if you just want the cheapest.
+In a script or CI without a terminal, `--choose` falls back to the cheapest
+rather than hanging on stdin.
+
 Useful guards: `--min-tokps 25` skips offers that fit but are too slow to use,
 `--exclude-geo ", CN"` avoids hosts that cannot reach HuggingFace, and `--ttl`
 sets the auto-destroy deadline.

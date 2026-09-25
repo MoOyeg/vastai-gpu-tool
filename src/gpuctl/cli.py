@@ -288,6 +288,8 @@ def _recipe_for(m, fit, *, context: int, fp8_kv: bool) -> "recipe_mod.Recipe":
 def launch(
     model: str = typer.Argument(..., help="model key (see `gpuctl models`)"),
     offer: Optional[int] = typer.Option(None, "--offer", help="specific offer id; default = cheapest fit"),
+    choose: bool = typer.Option(False, "--choose", help="pick from the cheapest few instead of taking #1"),
+    choices: int = typer.Option(5, "--choices", help="how many offers --choose lists (1-10)"),
     context: int = typer.Option(32768, "--context", "-c"),
     fp8_kv: bool = typer.Option(False, "--fp8-kv"),
     max_dph: Optional[float] = typer.Option(None, "--max-dph"),
@@ -319,9 +321,19 @@ def launch(
         if not fits:
             _fail(f"no offer fits {m.label} at {context:,} ctx under those constraints.")
 
-        chosen = next((f for f in fits if int(f.offer["id"]) == offer), None) if offer else fits[0]
-        if chosen is None:
-            _fail(f"offer {offer} is not among the {len(fits)} that fit; re-run `gpuctl plan {model}`.")
+        if offer is not None:
+            chosen = next((f for f in fits if int(f.offer["id"]) == offer), None)
+            if chosen is None:
+                _fail(f"offer {offer} is not among the {len(fits)} that fit; re-run `gpuctl plan {model}`.")
+        elif choose:
+            picked = _choose_offer([f.offer for f in fits], title=m.label, limit=choices,
+                                   ttl_hours=ttl, weights_gb=m.weights_gb)
+            if picked is None:
+                console.print("[dim]aborted — nothing rented.[/]")
+                raise typer.Exit(1)
+            chosen = next(f for f in fits if f.offer["id"] == picked["id"])
+        else:
+            chosen = fits[0]
 
         r = _recipe_for(m, chosen, context=context, fp8_kv=fp8_kv)
         s = provision.offer_summary(chosen.offer)
@@ -354,6 +366,96 @@ def launch(
         _watch_loop(dep, interval=10.0, set_default=set_default, reap=True, conductor=conductor, on_stall=on_stall)
     else:
         console.print(f"[dim]track it with:[/] gpuctl watch {dep.instance_id}")
+
+
+# ------------------------------------------------------------ offer picker
+
+# Thresholds behind the picker's warning flags. Each one cost real money to learn.
+SLOW_NET_MBPS = 500.0        # a 30-60 GB pull dominates cold start
+SHAKY_RELIABILITY = 0.97
+
+# NVIDIA's CUDA forward-compatibility package works on datacenter GPUs and not on
+# GeForce/workstation parts, so a CUDA 13 image on an older driver dies with
+# "CUDA error 804: forward compatibility was attempted on non supported HW".
+# compute_cap cannot express that distinction — a GeForce 3090 is 860 while a
+# datacenter A100 is 800 — so this keys on the product line instead.
+_DATACENTER_GPUS = ("a100", "h100", "h200", "h20", "b200", "b300", "gb",
+                    "v100", "p100", "p40", "a40", "a10", "l4", "l40", "tesla", "mi3")
+
+
+def _has_cuda_forward_compat(gpu_name: str) -> bool:
+    return any(h in (gpu_name or "").lower() for h in _DATACENTER_GPUS)
+
+
+def _offer_flags(offer: dict[str, Any], weights_gb: float | None = None) -> list[str]:
+    """Short warnings that changed an outcome at some point in this tool's life."""
+    flags: list[str] = []
+    geo = str(offer.get("geolocation") or "")
+    inet = float(offer.get("inet_down") or 0)
+    rel = float(offer.get("reliability2") or offer.get("reliability") or 0)
+    cuda = float(offer.get("cuda_max_good") or 0)
+
+    if geo.strip().lstrip(",").strip() in ("CN",) or geo.endswith(", CN"):
+        flags.append("CN: HuggingFace often throttled")
+    if inet and inet < SLOW_NET_MBPS:
+        mins = (weights_gb * 8 * 1000 / inet / 60) if weights_gb else None
+        flags.append(f"slow net {inet:.0f}Mbps"
+                     + (f" (~{mins:.0f}m pull)" if mins and mins >= 5 else ""))
+    if rel and rel < SHAKY_RELIABILITY:
+        flags.append(f"reliability {rel * 100:.1f}%")
+    if cuda and cuda < 13.0 and not _has_cuda_forward_compat(str(offer.get("gpu_name") or "")):
+        flags.append(f"CUDA {cuda:g}, no forward compat → error 804 risk")
+    return flags
+
+
+def _choose_offer(
+    offers: list[dict[str, Any]],
+    *,
+    title: str,
+    limit: int,
+    ttl_hours: float,
+    weights_gb: float | None = None,
+) -> dict[str, Any] | None:
+    """Let the user pick from the cheapest few. Returns None if they abort."""
+    shortlist = offers[:max(1, min(limit, 10))]
+    if len(shortlist) == 1:
+        return shortlist[0]
+    if not sys.stdin.isatty():
+        console.print("[dim]--choose needs a terminal; taking the cheapest offer.[/]")
+        return shortlist[0]
+
+    table = Table(title=f"{title} — cheapest {len(shortlist)}", header_style="bold")
+    table.add_column("#", style="bold cyan", justify="right")
+    table.add_column("offer", style="dim")
+    table.add_column("gpu")
+    table.add_column("$/hr", justify="right", style="bold")
+    table.add_column(f"${'' }{ttl_hours:g}h" if ttl_hours else "total", justify="right", style="dim")
+    table.add_column("rel.", justify="right")
+    table.add_column("net ↓", justify="right")
+    table.add_column("disk", justify="right")
+    table.add_column("location", style="dim")
+    table.add_column("notes", style="yellow")
+    for i, o in enumerate(shortlist, start=1):
+        sm = provision.offer_summary(o)
+        flags = _offer_flags(o, weights_gb)
+        table.add_row(
+            str(i), str(sm["id"]), sm["gpu"], f"{sm['dph']:.3f}",
+            f"{sm['dph'] * ttl_hours:.2f}" if ttl_hours else "—",
+            f"{sm['reliability'] * 100:.1f}%", f"{sm['inet_down']:.0f}",
+            f"{sm['disk']:.0f}G", str(sm["geo"])[:24],
+            "; ".join(flags),
+        )
+    console.print(table)
+    console.print("[dim]cheapest is #1. Anything in 'notes' has bitten this tool before.[/]")
+
+    while True:
+        raw = typer.prompt(f"Which offer? [1-{len(shortlist)}, or 'q' to abort]", default="1")
+        choice = raw.strip().lower()
+        if choice in ("q", "quit", "abort", "n", "no"):
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(shortlist):
+            return shortlist[int(choice) - 1]
+        console.print(f"[yellow]Enter a number from 1 to {len(shortlist)}, or 'q'.[/]")
 
 
 # ------------------------------------------------------------ models / plan
@@ -462,6 +564,8 @@ def plan(
 def up(
     recipe: str = typer.Argument(..., help="recipe key (see `gpuctl recipes`)"),
     offer: Optional[int] = typer.Option(None, "--offer", help="specific offer id; default = cheapest"),
+    choose: bool = typer.Option(False, "--choose", help="pick from the cheapest few instead of taking #1"),
+    choices: int = typer.Option(5, "--choices", help="how many offers --choose lists (1-10)"),
     max_dph: Optional[float] = typer.Option(None, "--max-dph", help="hard price ceiling, $/hr"),
     ttl: float = typer.Option(DEFAULT_TTL_HOURS, "--ttl", help="auto-destroy deadline in hours (0 = none)"),
     disk: Optional[int] = typer.Option(None, "--disk", help="disk GB (default: per recipe)"),
@@ -498,6 +602,11 @@ def up(
             chosen = next((o for o in offers if int(o.get("id", -1)) == offer), None)
             if chosen is None:
                 _fail(f"offer {offer} is not in the current result set; re-run `gpuctl search {r.key}`.")
+        elif choose:
+            chosen = _choose_offer(offers, title=r.title, limit=choices, ttl_hours=ttl)
+            if chosen is None:
+                console.print("[dim]aborted — nothing rented.[/]")
+                raise typer.Exit(1)
         else:
             chosen = offers[0]
 
