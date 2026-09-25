@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import shutil
 import subprocess
 import sys
 import time
@@ -849,10 +850,25 @@ def conductor_default(
     table.add_column(style="dim")
     table.add_column()
     table.add_row("settings", str(view.path))
-    for key in conductor_mod.MANAGED_KEYS:
+    for key in ("default", "review"):
         table.add_row(f"models.{key}", view.get(key) or "[dim]unset[/]")
+    try:
+        visible = conductor_mod.visible_models(path=view.path)
+    except conductor_mod.ConductorError:
+        visible = []
+    table.add_row("visible in picker",
+                  "\n".join(v.split(":", 1)[-1] for v in visible) if visible
+                  else "[yellow]none for opencode — the model switcher will not list it[/]")
+    binary = shutil.which("opencode")
     if view.opencode_executable:
-        table.add_row("opencode path", view.opencode_executable)
+        row = view.opencode_executable
+        if binary and view.opencode_executable != binary:
+            row += f"  [yellow](yours is {binary})[/]"
+        table.add_row("opencode path", row)
+    else:
+        table.add_row("opencode path",
+                      "[yellow]unset — Conductor uses its bundled opencode, which cannot "
+                      "see gpuctl providers[/]")
 
     # Say whether the configured model is actually reachable right now.
     live = {d.provider_id: d for d in state.load_all() if d.linked_at}
@@ -880,6 +896,7 @@ def conductor_set(
     """Set Conductor's default model to a linked deployment."""
     dep = _need(ref)
     target = Path(settings).expanduser() if settings else conductor_mod.SETTINGS_PATH
+    _ensure_conductor_uses_our_opencode(target)
     try:
         ref, previous = set_opencode_default(dep)
         console.print(f"[green]set[/] opencode model = [bold]{ref}[/]"
@@ -1123,6 +1140,43 @@ def ledger(
 # ------------------------------------------------------------ down / reap
 
 
+def _ensure_conductor_uses_our_opencode(path: Path | None = None) -> None:
+    """Make sure Conductor drives the opencode that has our provider.
+
+    Conductor ships its own opencode binary which runs with its own data
+    directory, so it never sees ~/.config/opencode/opencode.json. Selecting a
+    gpuctl provider then fails with "OpenCode did not load the model … within
+    15s", because Conductor is asking a different opencode about a provider it
+    has never heard of. This is deliberately not reverted on teardown — it is a
+    global "use my opencode" choice, correct regardless of what is running.
+    """
+    binary = shutil.which("opencode")
+    if not binary:
+        return
+    try:
+        view = conductor_mod.read(path)
+    except conductor_mod.ConductorError:
+        return
+    if not view.exists:
+        return
+    current = view.opencode_executable
+    if current == binary:
+        return
+    if current:
+        err.print(f"[yellow]note:[/] Conductor is set to use {current}, not {binary}. "
+                  f"If a gpuctl model fails to load, that is the likely reason.")
+        return
+    try:
+        edit = conductor_mod.set_opencode_executable(binary, path=path)
+    except conductor_mod.ConductorError as exc:
+        err.print(f"[yellow]could not set Conductor's opencode path:[/] {exc}")
+        return
+    if edit.changed:
+        console.print(f"[green]Conductor opencode path[/] → [bold]{binary}[/]"
+                      f"[dim]  (was unset, so Conductor used its bundled opencode, "
+                      f"which cannot see gpuctl providers)[/]")
+
+
 def _apply_conductor(dep: Deployment) -> None:
     """Point both opencode and Conductor at this deployment.
 
@@ -1130,6 +1184,7 @@ def _apply_conductor(dep: Deployment) -> None:
     `models.default` leaves opencode itself still configured for whatever it was
     on before. Both are set together.
     """
+    _ensure_conductor_uses_our_opencode()
     try:
         ref, previous = set_opencode_default(dep)
     except (opencode.OpencodeError, RuntimeError) as exc:

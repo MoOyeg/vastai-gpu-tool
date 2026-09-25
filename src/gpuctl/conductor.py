@@ -17,6 +17,7 @@ than the intended key moved, the write is rolled back.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 import tomllib
@@ -28,7 +29,18 @@ CONDUCTOR_DIR = Path.home() / ".conductor"
 SETTINGS_PATH = CONDUCTOR_DIR / "settings.toml"
 
 # Keys under [models] this feature is allowed to touch.
-MANAGED_KEYS = ("default", "review")
+MANAGED_KEYS = ("default", "review", "visible_provider_models")
+
+# `visible_provider_models` decides which models Conductor offers in its picker.
+# The schema types it as a bare string with no description; the format below was
+# read off a real value Conductor itself wrote, not guessed:
+#   {"claude":[],"codex":[],"opencode":["opencode:vast-1/Qwen3.8-27B-FP8"],…}
+# i.e. a JSON-encoded map of harness -> list of "<harness>:<provider>/<model>".
+VISIBLE_KEY = "visible_provider_models"
+DEFAULT_HARNESS = "opencode"
+
+# Root-level key naming which opencode binary Conductor drives.
+EXECUTABLE_KEY = "opencode_executable_path"
 
 
 class ConductorError(RuntimeError):
@@ -82,6 +94,14 @@ def _toml_str(value: str) -> str:
 _HEADER = re.compile(r"^\s*\[")
 
 
+def _root_span(lines: list[str]) -> tuple[int, int]:
+    """Lines belonging to the document root, i.e. before the first [table]."""
+    for i, ln in enumerate(lines):
+        if _HEADER.match(ln):
+            return 0, i
+    return 0, len(lines)
+
+
 def _table_span(lines: list[str], table: str) -> tuple[int, int] | None:
     """Line range holding `table`'s own keys, excluding any sub-tables.
 
@@ -100,44 +120,55 @@ def _table_span(lines: list[str], table: str) -> tuple[int, int] | None:
     return start, end
 
 
-def _set_key(text: str, table: str, key: str, value: str) -> str:
-    """Replace or insert `key = value` inside `table`, touching nothing else."""
+def _set_key(text: str, table: str | None, key: str, value: str) -> str:
+    """Replace or insert `key = value` in `table` (None = document root).
+
+    A root key must land before the first [table] header, or TOML would read it
+    as belonging to that table.
+    """
     lines = text.splitlines()
     rendered = f"{key} = {_toml_str(value)}"
-    span = _table_span(lines, table)
+    span = _root_span(lines) if table is None else _table_span(lines, table)
 
     if span is None:
         body = "" if not lines or lines[-1].strip() == "" else "\n"
         return text.rstrip("\n") + f"{body}\n[{table}]\n{rendered}\n"
 
     start, end = span
+    root = table is None
+    # Root keys have no header line to skip past.
+    first = start if root else start + 1
     # Capture indentation and any trailing comment so a user's annotation on the
     # line survives the value change.
     assign = re.compile(
         rf"^(\s*)(?:{re.escape(key)}|\"{re.escape(key)}\")\s*="
         r"\s*(?:\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^#\n]*?)\s*(#.*)?$"
     )
-    for i in range(start + 1, end):
+    for i in range(first, end):
         m = assign.match(lines[i])
         if m:
             trailing = f"  {m.group(2)}" if m.group(2) else ""
             lines[i] = f"{m.group(1)}{rendered}{trailing}"
             break
     else:
-        # Append after the table's existing keys, skipping back over the blank
-        # lines that separate it from the next section.
+        # Append after the existing keys, skipping back over the blank lines that
+        # separate this section from the next.
         at = end
-        while at > start + 1 and not lines[at - 1].strip():
+        while at > first and not lines[at - 1].strip():
             at -= 1
         lines.insert(at, rendered)
     return "\n".join(lines) + "\n"
 
 
-def _expected(data: dict[str, Any], updates: dict[str, str]) -> dict[str, Any]:
+def _expected(data: dict[str, Any], updates: dict[str, str],
+              root: dict[str, str] | None = None) -> dict[str, Any]:
     out = {k: (dict(v) if isinstance(v, dict) else v) for k, v in data.items()}
-    models = dict(out.get("models") or {})
-    models.update(updates)
-    out["models"] = models
+    if updates:
+        models = dict(out.get("models") or {})
+        models.update(updates)
+        out["models"] = models
+    if root:
+        out.update(root)
     return out
 
 
@@ -195,6 +226,106 @@ def set_models(
         changed=dict(updates),
         previous={k: (base.get("models") or {}).get(k) for k in updates},
     )
+
+
+def _visible_map(view: ConductorView) -> dict[str, list[str]]:
+    raw = view.models.get(VISIBLE_KEY)
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {k: list(v) for k, v in parsed.items() if isinstance(v, list)}
+
+
+def visible_models(harness: str = DEFAULT_HARNESS, *, path: Path | None = None) -> list[str]:
+    return _visible_map(read(path)).get(harness, [])
+
+
+def set_visible(
+    refs: list[str],
+    *,
+    harness: str = DEFAULT_HARNESS,
+    path: Path | None = None,
+) -> str:
+    """Replace the visible-model list for one harness, leaving others alone.
+
+    Returns the JSON string written. Entries are stored as "<harness>:<ref>",
+    which is the shape Conductor uses.
+    """
+    view = read(path)
+    current = _visible_map(view)
+    # Preserve the harnesses Conductor knows about even when empty, so the app
+    # does not see keys disappear.
+    for known in ("claude", "codex", "cursor", harness, "pi"):
+        current.setdefault(known, [])
+    current[harness] = [r if r.startswith(f"{harness}:") else f"{harness}:{r}" for r in refs]
+    return json.dumps(current, separators=(",", ":"))
+
+
+def add_visible_model(
+    ref: str, *, harness: str = DEFAULT_HARNESS, path: Path | None = None
+) -> str | None:
+    """Make `provider/model` selectable in Conductor. None if already present."""
+    existing = visible_models(harness, path=path)
+    entry = f"{harness}:{ref}"
+    if entry in existing:
+        return None
+    stripped = [e.split(":", 1)[1] if e.startswith(f"{harness}:") else e for e in existing]
+    return set_visible(stripped + [ref], harness=harness, path=path)
+
+
+def remove_visible_model(
+    ref: str, *, harness: str = DEFAULT_HARNESS, path: Path | None = None
+) -> str | None:
+    """Drop `provider/model` from the picker. None if it was not there."""
+    existing = visible_models(harness, path=path)
+    entry = f"{harness}:{ref}"
+    if entry not in existing:
+        return None
+    kept = [e for e in existing if e != entry]
+    stripped = [e.split(":", 1)[1] if e.startswith(f"{harness}:") else e for e in kept]
+    return set_visible(stripped, harness=harness, path=path)
+
+
+def set_opencode_executable(binary: str, *, path: Path | None = None) -> ConductorEdit:
+    """Point Conductor at a specific opencode binary.
+
+    Conductor ships its own opencode, which runs with its own data directory and
+    therefore never reads ~/.config/opencode/opencode.json — so a provider gpuctl
+    wrote there is invisible to it, and selecting that model fails with
+    "OpenCode did not load the model ... within 15s". Naming the user's own
+    binary is the documented fix.
+    """
+    path = path or SETTINGS_PATH
+    view = read(path)
+    if not view.exists:
+        raise ConductorError(f"{path} does not exist.")
+
+    original = path.read_text(encoding="utf-8")
+    previous = view.opencode_executable
+    if previous == binary:
+        return ConductorEdit(path, None, {}, {EXECUTABLE_KEY: previous})
+
+    backup = path.with_name(f"{path.stem}.{int(time.time())}.bak")
+    backup.write_text(original, encoding="utf-8")
+    updated = _set_key(original, None, EXECUTABLE_KEY, binary)
+
+    try:
+        reparsed = tomllib.loads(updated)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConductorError(f"edit produced invalid TOML, not written: {exc}") from None
+    want = _expected(view.data, {}, {EXECUTABLE_KEY: binary})
+    if reparsed != want:
+        raise ConductorError(
+            "edit would have changed more than the executable path, not written.")
+
+    path.write_text(updated, encoding="utf-8")
+    return ConductorEdit(path, backup, {EXECUTABLE_KEY: binary},
+                         {EXECUTABLE_KEY: previous})
 
 
 def revert(previous: dict[str, str | None], *, path: Path | None = None) -> list[str]:

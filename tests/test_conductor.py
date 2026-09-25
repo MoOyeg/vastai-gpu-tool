@@ -165,7 +165,8 @@ def test_previous_value_survives_repointing(settings):
 def test_unlink_clears_tracking(settings):
     d = dep()
     track.link_conductor(d, path=settings)
-    assert track.unlink_conductor(state.find(7)) == ["default"]
+    restored = track.unlink_conductor(state.find(7))
+    assert "default" in restored
     after = state.find(7)
     assert after.conductor_target == "" and after.conductor_prev == {}
     assert track.unlink_conductor(after) == [], "second revert is a no-op"
@@ -243,3 +244,101 @@ def test_setting_the_same_default_twice_is_a_noop(oc_config):
                                            model_ref="vast-9/Qwen3.8-27B-FP8")
     assert previous == "vast-9/Qwen3.8-27B-FP8"
     assert backup is None, "no backup churn when nothing changes"
+
+
+# ----------------------------------------------- the bundled-opencode trap
+
+
+def test_sets_the_opencode_executable_path(settings):
+    """Conductor's own opencode runs with its own data dir and never reads
+    ~/.config/opencode/opencode.json, so a gpuctl provider is invisible to it and
+    selecting that model fails with 'did not load the model … within 15s'."""
+    edit = conductor.set_opencode_executable("/opt/homebrew/bin/opencode", path=settings)
+    assert edit.changed[conductor.EXECUTABLE_KEY] == "/opt/homebrew/bin/opencode"
+    assert parse(settings)["opencode_executable_path"] == "/opt/homebrew/bin/opencode"
+
+
+def test_executable_path_lands_in_the_document_root(settings):
+    """A root key written after a [table] header would be read as part of it."""
+    conductor.set_opencode_executable("/usr/local/bin/opencode", path=settings)
+    text = settings.read_text()
+    assert text.index("opencode_executable_path") < text.index("[git]")
+    # neighbours intact
+    d = parse(settings)
+    assert d["git"]["branch_prefix_type"] == "github_username"
+    assert d["models"]["default"] == "opus"
+    assert d["models"]["codex"]["default_thinking_level"] == "high"
+
+
+def test_setting_the_same_executable_is_a_noop(settings):
+    conductor.set_opencode_executable("/opt/homebrew/bin/opencode", path=settings)
+    edit = conductor.set_opencode_executable("/opt/homebrew/bin/opencode", path=settings)
+    assert edit.changed == {}
+    assert edit.backup is None
+
+
+# ------------------------------------------------- visible_provider_models
+
+
+VISIBLE_REAL = ('{"claude":[],"codex":[],"cursor":[],'
+                '"opencode":["opencode:vast-1/ModelA"],"pi":[]}')
+
+
+def with_visible(settings, raw):
+    settings.write_text(settings.read_text().replace(
+        'default = "opus"   # keep me',
+        'default = "opus"   # keep me\nvisible_provider_models = '
+        + __import__("json").dumps(raw)))
+    return settings
+
+
+def test_reads_the_visible_list(settings):
+    with_visible(settings, VISIBLE_REAL)
+    assert conductor.visible_models(path=settings) == ["opencode:vast-1/ModelA"]
+
+
+def test_no_visible_list_means_nothing_is_offered(settings):
+    assert conductor.visible_models(path=settings) == []
+
+
+def test_adding_a_model_preserves_other_harnesses(settings):
+    import json as _json
+    with_visible(settings, VISIBLE_REAL)
+    raw = conductor.add_visible_model("vast-2/ModelB", path=settings)
+    parsed = _json.loads(raw)
+    assert parsed["opencode"] == ["opencode:vast-1/ModelA", "opencode:vast-2/ModelB"]
+    assert set(parsed) == {"claude", "codex", "cursor", "opencode", "pi"}
+    assert parsed["codex"] == []
+
+
+def test_adding_an_existing_model_is_a_noop(settings):
+    with_visible(settings, VISIBLE_REAL)
+    assert conductor.add_visible_model("vast-1/ModelA", path=settings) is None
+
+
+def test_removing_a_model(settings):
+    import json as _json
+    with_visible(settings, VISIBLE_REAL)
+    raw = conductor.remove_visible_model("vast-1/ModelA", path=settings)
+    assert _json.loads(raw)["opencode"] == []
+
+
+def test_removing_an_absent_model_is_a_noop(settings):
+    with_visible(settings, VISIBLE_REAL)
+    assert conductor.remove_visible_model("vast-9/Nope", path=settings) is None
+
+
+def test_unparseable_visible_list_is_treated_as_empty(settings):
+    with_visible(settings, "not json at all")
+    assert conductor.visible_models(path=settings) == []
+    # and adding still produces a valid document
+    raw = conductor.add_visible_model("vast-1/ModelA", path=settings)
+    assert "opencode:vast-1/ModelA" in raw
+
+
+def test_linking_makes_the_model_visible(settings, oc_config):
+    import json as _json
+    edit = track.link_conductor(linked_dep(oc_config), path=settings)
+    assert conductor.VISIBLE_KEY in edit.changed
+    listed = _json.loads(parse(settings)["models"][conductor.VISIBLE_KEY])
+    assert listed["opencode"] == ["opencode:vast-9/Qwen3.8-27B-FP8"]

@@ -386,19 +386,42 @@ restoring *your* original model, not an earlier one of ours — so Conductor is
 never left pointing at a destroyed instance, and `gpuctl conductor` flags it
 loudly if something else left it that way.
 
-**If the model still does not appear in Conductor's picker**, that is a separate
-thing and not something gpuctl can set. Conductor's picker is driven by its own
-favourites list, held in `~/Library/Application Support/com.conductor.app/conductor.db`:
+`--conductor` sets three things, because two of them are traps:
+
+| setting | why |
+|---|---|
+| `models.default` | the model new chats use |
+| `models.visible_provider_models` | what the **model switcher lists** — without it the model is configured but unlistable |
+| `opencode_executable_path` | which opencode binary Conductor drives |
+
+**The executable path is the one that produces a baffling error.** Conductor
+ships its own opencode, which runs with its own data directory and therefore
+never reads `~/.config/opencode/opencode.json`. Selecting a gpuctl model then
+fails with:
 
 ```
-favorite_models.configuration = {"type":"built-in","agent":"codex","model":"gpt-5.6-sol",…}
+Error: OpenCode did not load the model "vast-…/…" within 15s. The provider's
+model catalog may still be loading, or its credentials may be missing …
 ```
 
-`models.default` in `settings.toml` chooses the model for *new chats*; it does
-not add an entry to that list. Add the OpenCode model once in Conductor's UI
-(Settings → Harnesses → OpenCode) and it will appear thereafter. gpuctl
-deliberately does not write to that database — it belongs to a running app and
-carries org/user ids that look server-synced.
+The message points at authentication, but nothing is unauthenticated — Conductor
+is asking a *different* opencode about a provider it has never heard of. Its own
+discovery cache shows it plainly: keyed by opencode binary, the bundled one
+reports 9 models with no `vast-` or `omlx` entries, while `/opt/homebrew/bin/opencode`
+reports 10 including both. gpuctl now sets `opencode_executable_path` to whatever
+`which opencode` finds, and **does not revert it on teardown** — it is a global
+"use my opencode" choice, correct regardless of what is running. If you have
+already set it to something else, gpuctl says so rather than overwriting.
+
+`visible_provider_models` is typed in Conductor's schema as a bare string with no
+description. The format below was read off a real value Conductor itself wrote,
+not guessed — a JSON-encoded map of harness to `"<harness>:<provider>/<model>"`:
+
+```json
+{"claude":[],"codex":[],"cursor":[],"opencode":["opencode:vast-1/Qwen3.8-27B-FP8"],"pi":[]}
+```
+
+gpuctl merges into it and leaves the other harnesses untouched.
 
 The written value is the provider-qualified id Conductor expects, which is the
 same one opencode uses:

@@ -387,6 +387,11 @@ def link_conductor(
     updates = {"default": ref}
     if also_review:
         updates["review"] = ref
+    # Setting models.default alone does not put the model in Conductor's picker;
+    # visible_provider_models is what the model switcher lists.
+    visible = conductor.add_visible_model(ref, path=path)
+    if visible:
+        updates[conductor.VISIBLE_KEY] = visible
 
     edit = conductor.set_models(updates, path=path)
     dep.conductor_target = str(edit.path)
