@@ -196,3 +196,54 @@ def test_stalled_counts_as_wasting_money():
     assert Phase.ERROR.wasting_money
     assert not Phase.LOADING.wasting_money
     assert not Phase.SERVING.wasting_money
+
+
+# ------------------------------------------------- provisioning trouble signals
+
+
+@pytest.mark.parametrize("msg,expected", [
+    ("curl: (6) Could not resolve host: cloud.vast.ai", True),
+    ("failed to pull: manifest unknown", True),
+    ("write /var/lib/docker: no space left on device", True),
+    ("toomanyrequests: rate limit exceeded", True),
+    # must NOT match: the apt package name that fooled an earlier version
+    ("Get:17 .../liberror-perl all 0.17029-2 [25.6 kB]", False),
+    # must NOT match: apt's own wording is "Could not resolve '<host>'", and a
+    # transient apt DNS hiccup during package install is not provisioning death
+    ("E: Could not resolve 'archive.ubuntu.com'", False),
+    ("success, running vllm/vllm-openai_latest/ssh", False),
+    ("0db1731e65c7: Download complete", False),
+    ("", False),
+    (None, False),
+])
+def test_suspicious_status_matching_is_narrow(msg, expected):
+    assert bool(track.suspicious_status(msg)) is expected
+
+
+def test_trouble_shortens_the_threshold_but_does_not_condemn():
+    """A host seen emitting the DNS error recovered and pulled the image, so a
+    match must never by itself mark the deployment failed."""
+    d = dep()
+    c = Client(inst(status="loading", msg="curl: (6) Could not resolve host: cloud.vast.ai",
+                    ports={}, disk=0.0))
+    snap = snapshot(c, d)
+    assert snap.phase is Phase.LOADING, "must not be condemned on sight"
+
+    # LOADING's normal threshold is 1800s; trouble shortens it to 480s.
+    d = age(state.find(42), 600)
+    d.log_size = 100; d.log_checked_at = time.time(); state.save(d)
+    snap = snapshot(c, state.find(42))
+    assert snap.phase is Phase.STALLED
+    assert "DNS" in snap.detail or "resolve" in snap.detail.lower()
+
+
+def test_recovering_host_is_not_condemned():
+    """Once provisioning moves on, the shortened threshold stops applying."""
+    d = dep()
+    c = Client(inst(status="loading", msg="curl: (6) Could not resolve host: cloud.vast.ai",
+                    ports={}, disk=0.0))
+    snapshot(c, d)
+    d = age(state.find(42), 600)
+    # Vast retried and the image is now pulling.
+    c.instance = inst(status="loading", msg="0db1731e65c7: Download complete", ports={}, disk=2.0)
+    assert snapshot(c, state.find(42)).phase is Phase.LOADING

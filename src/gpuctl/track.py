@@ -50,6 +50,47 @@ PHASE_STYLE = {
 # Image pulls are quiet for a while but Vast streams layer progress through
 # status_msg, so LOADING still moves; once the container is up, a healthy vLLM
 # is always doing something visible (downloading, loading, or capturing graphs).
+# Provisioning trouble worth reacting to, keyed on an unambiguous phrase Vast
+# surfaces through status_msg. Each is specific enough that it cannot match
+# benign setup output -- note the deliberate contrast with the earlier bug where
+# a bare "error" substring matched the apt package name "liberror-perl".
+#
+# These are NOT treated as terminal. Vast retries its provisioning steps, and a
+# host observed emitting "curl: (6) Could not resolve host: cloud.vast.ai"
+# recovered on its own and went on to pull the image — condemning it would have
+# destroyed a working box. Instead a match shortens the stall threshold, so a
+# blip that resolves costs nothing while one that does not is caught in minutes
+# rather than half an hour.
+#
+# curl's wording is "Could not resolve host: <h>"; apt's is "Could not resolve
+# '<h>'", so requiring the literal word "host" keeps this to Vast's own step.
+SUSPICIOUS_STATUS_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("could not resolve host",
+     "container DNS failed to resolve; if it persists the box cannot reach HuggingFace either"),
+    ("no space left on device", "the machine ran out of disk"),
+    ("manifest unknown", "that image tag does not exist"),
+    ("pull access denied", "the image is private, or the tag is wrong"),
+    ("repository does not exist", "the image name is wrong"),
+    ("toomanyrequests", "the registry rate-limited the image pull"),
+)
+
+
+def suspicious_status(status_msg: str | None) -> tuple[str, str] | None:
+    """Recognise provisioning trouble. Returns (phrase, why) or None.
+
+    Matching is narrow on purpose: status_msg also carries Vast's streamed
+    image-build log, which is full of innocent words.
+    """
+    text = (status_msg or "").lower()
+    for phrase, why in SUSPICIOUS_STATUS_PATTERNS:
+        if phrase in text:
+            return phrase, why
+    return None
+
+
+# Threshold used instead of the phase default once status_msg shows trouble.
+SUSPICIOUS_STALL_AFTER = 480.0   # 8 min
+
 # Minimum gap between log fetches while a stall is suspected.
 LOG_CHECK_INTERVAL = 120.0
 
@@ -134,6 +175,12 @@ def snapshot(
     if limit is None or snap.instance is None:
         return snap
 
+    # Provisioning trouble does not condemn a box -- Vast retries and hosts do
+    # recover -- but it does mean we should stop waiting sooner.
+    trouble = suspicious_status(snap.instance.get("status_msg"))
+    if trouble:
+        limit = min(limit, SUSPICIOUS_STALL_AFTER)
+
     marker = progress_marker(snap.instance, snap.phase)
     now = time.time()
     if marker != dep.progress_marker or not dep.progress_at:
@@ -168,7 +215,9 @@ def snapshot(
     snap.phase = Phase.STALLED
     mins = stalled_for / 60
     detail = f"no progress for {mins:.0f}m"
-    if confirm_with_logs and dep.log_size:
+    if trouble:
+        detail += f"; {trouble[1]}"
+    elif confirm_with_logs and dep.log_size:
         detail += "; container log not growing either"
     snap.detail = f"{detail} (was: {snap.detail})" if snap.detail else detail
     return snap
@@ -223,6 +272,7 @@ def _observe(client: VastClient, dep: Deployment, *, deep: bool = True) -> Snaps
         return Snapshot(dep, Phase.STOPPED, inst, None, None, status_msg or status, cost)
     if status in ("error", "failed"):
         return Snapshot(dep, Phase.ERROR, inst, None, None, status_msg or status, cost)
+
     # NB: never infer failure from status_msg. During provisioning Vast streams
     # the image build log through that field, and apt package names such as
     # "liberror-perl" contain the substring "error". actual_status is the only

@@ -62,6 +62,18 @@ about:
   that Vast occasionally rewrites (observed dropping a `/ssh` suffix). So it
   counts during `loading` and is ignored afterwards.
 
+**Provisioning trouble shortens the clock, it does not condemn.** Vast surfaces
+its own setup failures through `status_msg` — a real example being
+`curl: (6) Could not resolve host: cloud.vast.ai`, meaning the machine's
+container DNS failed, so it could not reach HuggingFace either. An earlier
+version of this treated such signatures as terminal; testing against a live host
+that emitted exactly that showed it **recovered on its own and went on to pull
+the image**, so condemning it would have destroyed a working box. A match now
+just lowers the stall threshold from 30 minutes to 8, which costs nothing when
+the blip resolves and catches a genuinely stuck host quickly. Matching stays
+narrow — `curl`'s wording is `Could not resolve host: <h>` while `apt`'s is
+`Could not resolve '<h>'`, and only the former is treated as a signal.
+
 What is left — `actual_status`, `disk_usage`, and the **container log** — is
 honest. The log is the deciding signal once the container is up, since a working
 vLLM always writes to it. It is fetched only once a stall is already suspected
