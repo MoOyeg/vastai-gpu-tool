@@ -1269,6 +1269,24 @@ def reap(
 
 # ------------------------------------------------------------------- bench
 
+# A reasoning model streams its thinking in `delta.reasoning` (or
+# `reasoning_content`, depending on the vLLM parser) and may emit no `content` at
+# all inside the token budget. Those are still generated tokens costing the same
+# decode time, so all of them count. Keying on `content` alone made bench report
+# "no tokens were streamed back" against Qwen3.8, which spent 30 of 34 tokens
+# thinking and whose only `content` chunk was an empty string.
+TOKEN_DELTA_FIELDS = ("content", "reasoning", "reasoning_content")
+REASONING_DELTA_FIELDS = ("reasoning", "reasoning_content")
+
+
+def _delta_token(delta: dict[str, Any]) -> tuple[str, bool] | None:
+    """Extract (text, is_reasoning) from a streamed delta, or None if it has no token."""
+    for field in TOKEN_DELTA_FIELDS:
+        value = delta.get(field)
+        if isinstance(value, str) and value:
+            return value, field in REASONING_DELTA_FIELDS
+    return None
+
 
 @app.command()
 def bench(
@@ -1306,10 +1324,18 @@ def bench(
         # carries one token, but that is a convention, not a guarantee.
         "stream_options": {"include_usage": True},
     }
+    # A reasoning model streams its thinking in `delta.reasoning` (or
+    # `reasoning_content`, depending on the parser) and may emit no `content` at
+    # all within the token budget. Those are still generated tokens costing the
+    # same decode time, so all of them count — keying on `content` alone made
+    # bench report "no tokens were streamed back" against Qwen3.8, which spent
+    # 30 of 34 tokens thinking.
     started = time.perf_counter()
     first_token_at: float | None = None
     tokens = 0
+    reasoning_chunks = 0
     reported: int | None = None
+    reported_reasoning: int | None = None
     with httpx.stream(
         "POST", url, json=body, timeout=600.0,
         headers={"Authorization": f"Bearer {dep.serve_key}"},
@@ -1327,17 +1353,25 @@ def bench(
             except ValueError:
                 continue
             if event.get("usage"):
-                reported = event["usage"].get("completion_tokens")
+                usage = event["usage"]
+                reported = usage.get("completion_tokens")
+                details = usage.get("completion_tokens_details") or {}
+                reported_reasoning = details.get("reasoning_tokens")
             choices = event.get("choices") or []
-            if not (choices and (choices[0].get("delta") or {}).get("content")):
+            delta = (choices[0].get("delta") or {}) if choices else {}
+            found = _delta_token(delta)
+            if found is None:
                 continue
+            if found[1]:
+                reasoning_chunks += 1
             if first_token_at is None:
                 first_token_at = time.perf_counter()
             tokens += 1
     finished = time.perf_counter()
 
     if not tokens or first_token_at is None:
-        _fail("no tokens were streamed back.")
+        _fail("no tokens were streamed back — the server accepted the request but "
+              "produced nothing. Check `gpuctl logs` for the model's own errors.")
     ttft = first_token_at - started
     decode_s = max(finished - first_token_at, 1e-6)
     counted = reported or tokens
@@ -1352,6 +1386,10 @@ def bench(
     table.add_row("TTFT", f"{ttft * 1000:.0f} ms")
     source = "server-reported" if reported else "chunk count"
     table.add_row("decode", f"[bold]{tokps:.1f} tok/s[/]  ({counted} tokens, {source}, in {decode_s:.1f}s)")
+    thinking = reported_reasoning if reported_reasoning is not None else reasoning_chunks
+    if thinking:
+        table.add_row("of which reasoning", f"{thinking} tokens "
+                      f"({thinking / counted:.0%} of the budget spent thinking)")
     table.add_row("ITL / TPOT", f"{1000 / tokps:.0f} ms" if tokps else "—")
     table.add_row("doc estimate", f"{est}   [dim]({dep.notes.get('doc_ref', '')})[/]")
     table.add_row("cost of this run", _money(dep.dph_at_launch * (finished - started) / 3600))

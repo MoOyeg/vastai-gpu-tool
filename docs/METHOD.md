@@ -135,6 +135,21 @@ measurement; the conservative table stands until someone runs it.
 Also confirmed: `awq_marlin` engages on Blackwell (sm_120) —
 `Using MarlinLinearKernel for AutoAWQMarlinLinearMethod`.
 
+### Qwen3.8 27B FP8 · 1× RTX PRO 6000 WS · TP=1 · 131k ctx · $1.49/hr
+
+| metric | value |
+|---|---|
+| decode | **50.7 tok/s** |
+| TTFT | ~175 ms |
+| ITL / TPOT | 20 ms |
+
+**Reasoning tokens are decode tokens.** At its default `xhigh` effort this model
+spent **100% of a 400-token budget thinking** and never reached an answer. Two
+consequences: a throughput measurement must count `delta.reasoning`, not just
+`delta.content` (counting only content measures zero and looks like a broken
+endpoint); and an agent using it needs a generous `max_tokens`, or a lower
+`reasoning_effort`, or it will burn the whole budget before replying.
+
 ## 8. The rent-test matrix
 
 The preset recipes in `recipes.py` exist to answer, with measurements rather than
