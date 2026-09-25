@@ -1,0 +1,14 @@
+# a6000 — see docs/METHOD.md §8
+
+title = "1x RTX A6000 48 GB — long-context single card"
+gpu_name = "RTX A6000"
+num_gpus = 1
+model_key = "llama70b"
+disk_gb = 150
+max_dph = 0.6
+min_inet_down = 400
+min_cuda = 13.0
+est_tokps = "~11"
+doc_ref = "METHOD §3"
+notes = "Slow but ~28k ctx at fp16 KV on one card. Tests context-vs-speed directly."
+vllm_args = ["--max-model-len", "28672", "--gpu-memory-utilization", "0.92"]

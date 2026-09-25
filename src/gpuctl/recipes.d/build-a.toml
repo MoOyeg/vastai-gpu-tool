@@ -1,0 +1,14 @@
+# build-a — see docs/METHOD.md §8
+
+title = "Build A — 2x RTX 3090, TP=2, 70B Q4"
+gpu_name = "RTX 3090"
+num_gpus = 2
+model_key = "llama70b"
+disk_gb = 150
+max_dph = 0.7
+min_inet_down = 400
+min_cuda = 13.0
+est_tokps = "~18-22"
+doc_ref = "METHOD §8"
+notes = "Is 48 GB usable at fp8 KV, and does awq_marlin engage?"
+vllm_args = ["--tensor-parallel-size", "2", "--kv-cache-dtype", "fp8", "--max-model-len", "14336", "--gpu-memory-utilization", "0.92"]

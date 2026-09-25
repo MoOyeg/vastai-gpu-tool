@@ -1,0 +1,15 @@
+# pro6000 — see docs/METHOD.md §8
+
+title = "1x RTX PRO 6000 Blackwell 96 GB — the 120B MoE question"
+gpu_name = "RTX PRO 6000 WS"
+num_gpus = 1
+model_key = "gpt-oss-120b"
+disk_gb = 250
+max_dph = 2.5
+min_inet_down = 800
+min_gpu_ram_mb = 90000
+min_cuda = 13.0
+est_tokps = "~28 dense / MoE ≫"
+doc_ref = "METHOD §6"
+notes = "Does the 120B MoE class actually run, and how fast? Three Blackwell variants exist (WS / S / Max-Q); none were rentable on 2026-09-10."
+vllm_args = ["--max-model-len", "32768", "--gpu-memory-utilization", "0.92"]

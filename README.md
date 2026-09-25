@@ -67,6 +67,38 @@ pending → loading → running → serving → linked
 
 ## Recipes
 
+Recipes are **data, not code** — one TOML file each, read at runtime:
+
+```
+src/gpuctl/recipes.d/        shipped with the package
+~/.config/gpuctl/recipes/    yours; same filename replaces a builtin
+$GPUCTL_RECIPES_DIR          one or more extra dirs (os.pathsep-separated)
+```
+
+Later directories win, so dropping `build-a.toml` in your own directory
+overrides the shipped one, and `my-rig.toml` adds `gpuctl up my-rig`.
+`gpuctl recipes --paths` prints the live search path; `--show <key>` prints one
+file verbatim.
+
+```toml
+# ~/.config/gpuctl/recipes/dual-5090.toml
+title      = "2x RTX 5090 — measured 60 tok/s on 70B"
+gpu_name   = "RTX 5090"          # must match Vast's catalogue; see `gpuctl gpus`
+num_gpus   = 2
+model_key  = "llama70b"          # inherits the HF id AND the tool-call parser
+disk_gb    = 110
+max_dph    = 1.30
+est_tokps  = "~60 (measured)"
+vllm_args  = ["--tensor-parallel-size", "2", "--max-model-len", "32768"]
+```
+
+`model_key` points at the model catalogue (`gpuctl models`) so a recipe inherits
+the HuggingFace id and — importantly — the right `--tool-call-parser`. Set
+`model` and `tool_parser` directly instead for anything not in the catalogue.
+Files are validated on load: unknown fields, wrong types and unknown model keys
+fail with the filename and the offending field rather than surfacing later as a
+malformed Vast query.
+
 Each recipe is one configuration worth measuring before buying it
 ([docs/METHOD.md §8](docs/METHOD.md)). `est tok/s` is the *prediction*;
 `gpuctl bench` produces the measurement to check it against.
@@ -116,7 +148,8 @@ isn't plain JSON is refused rather than rewritten.
 | `vast.py` | Vast REST client (`/bundles/`, `/asks/{id}/`, `/instances/`) |
 | `models.py` | model catalogue + VRAM/KV/TP arithmetic |
 | `planner.py` | fits models to live offers, cheapest first |
-| `recipes.py` | preset launch configurations |
+| `recipes.py` | TOML recipe loader, merge order and validation |
+| `recipes.d/*.toml` | the shipped recipes themselves |
 | `provision.py` | offer search, port/env mapping, vLLM onstart script |
 | `track.py` | phase state machine, cost accounting, link/unlink |
 | `health.py` | `/v1/models` readiness probe |
@@ -179,6 +212,15 @@ These cost real debugging time, so they are written down:
   without this, a multi-config search or a tight `watch` trips it.
 - **GPU names are more specific than you expect.** There is no `RTX PRO 6000` —
   it is `RTX PRO 6000 WS` / `S` / `Max-Q`. Check with `gpuctl gpus -f 6000`.
+
+## Tests
+
+```bash
+uv run --group dev pytest        # 49 tests, no network, ~0.1s
+```
+
+The suite stubs out the readiness probe globally, so nothing reaches the network
+and no test touches your real opencode config, state or recipe directories.
 
 ## Notes
 

@@ -1,0 +1,14 @@
+# build-b — see docs/METHOD.md §8
+
+title = "Build B — 2x RTX 4090, TP=2, 70B Q4"
+gpu_name = "RTX 4090"
+num_gpus = 2
+model_key = "llama70b"
+disk_gb = 150
+max_dph = 1.0
+min_inet_down = 400
+min_cuda = 13.0
+est_tokps = "~20-25"
+doc_ref = "METHOD §8"
+notes = "Is 2x 4090 really ~1.7x a 3090 pair, or ~1.1x? Bandwidth says the latter."
+vllm_args = ["--tensor-parallel-size", "2", "--kv-cache-dtype", "fp8", "--max-model-len", "14336", "--gpu-memory-utilization", "0.92"]

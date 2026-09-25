@@ -155,9 +155,9 @@ def link_opencode(
 
 
 def _context_from_args(dep: Deployment) -> int | None:
-    from .recipes import RECIPES
+    from .recipes import all_recipes
 
-    recipe = RECIPES.get(dep.recipe)
+    recipe = all_recipes().get(dep.recipe)
     if not recipe:
         return None
     args = recipe.vllm_args

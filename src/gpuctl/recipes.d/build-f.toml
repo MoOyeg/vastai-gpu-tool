@@ -1,0 +1,14 @@
+# build-f — see docs/METHOD.md §8
+
+title = "Build F+ — 4x RTX 3090, TP=4, 70B Q4"
+gpu_name = "RTX 3090"
+num_gpus = 4
+model_key = "llama70b"
+disk_gb = 150
+max_dph = 1.3
+min_inet_down = 400
+min_cuda = 13.0
+est_tokps = "~28-35"
+doc_ref = "METHOD §8"
+notes = "96 GB, fp16 KV, real 32k context. Fastest of the 3090 configurations."
+vllm_args = ["--tensor-parallel-size", "4", "--max-model-len", "32768", "--gpu-memory-utilization", "0.92"]

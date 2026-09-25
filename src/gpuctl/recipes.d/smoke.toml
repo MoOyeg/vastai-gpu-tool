@@ -1,0 +1,14 @@
+# smoke — see docs/METHOD.md §8
+
+title = "Smoke test — 1x cheap 24 GB, 7B AWQ"
+gpu_name = "RTX 3090"
+num_gpus = 1
+model_key = "qwen7b"
+disk_gb = 40
+max_dph = 0.3
+min_inet_down = 200
+min_cuda = 13.0
+est_tokps = "~80-120"
+doc_ref = "n/a"
+notes = "Exercises the whole pipeline for pennies. Run this first."
+vllm_args = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.90"]

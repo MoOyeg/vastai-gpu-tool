@@ -28,6 +28,7 @@ from .config import (
 from .health import completion_smoke
 from .state import Deployment
 from .track import PHASE_STYLE, Phase, link_opencode, snapshot, unlink_opencode
+from .recipes import BUILTIN_DIRNAME as BUILTIN_DIR
 from .vast import VastClient, VastError, normalize_gpu_name, ssh_target
 
 app = typer.Typer(
@@ -152,8 +153,34 @@ def gpus(filter: str = typer.Option("", "--filter", "-f", help="substring match"
 
 
 @app.command("recipes")
-def list_recipes() -> None:
-    """Show the built-in launch recipes."""
+def list_recipes(
+    paths: bool = typer.Option(False, "--paths", help="show the directories recipes are read from"),
+    show: Optional[str] = typer.Option(None, "--show", help="print one recipe's TOML verbatim"),
+) -> None:
+    """Show the launch recipes loaded from disk."""
+    if paths:
+        console.print("[bold]recipe search path[/] [dim](later overrides earlier)[/]")
+        for d in recipe_mod.search_dirs():
+            n = len(list(d.glob("*.toml"))) if d.is_dir() else 0
+            mark = "[green]✓[/]" if d.is_dir() else "[dim]·[/]"
+            console.print(f"  {mark} {d}  [dim]({n} recipe(s))[/]")
+        console.print(f"\n[dim]Drop a .toml in {recipe_mod.USER_RECIPES_DIR} to add or override one.[/]")
+        console.print(f"[dim]Or point ${recipe_mod.ENV_VAR} at one or more directories.[/]")
+        return
+
+    if show:
+        try:
+            r = recipe_mod.get(show)
+        except KeyError as exc:
+            _fail(str(exc))
+        console.print(f"[dim]{r.source}[/]")
+        console.print(Path(r.source).read_text().rstrip())
+        return
+
+    try:
+        loaded = recipe_mod.all_recipes()
+    except recipe_mod.RecipeError as exc:
+        _fail(str(exc))
     table = Table(title="gpuctl recipes", header_style="bold")
     table.add_column("key", style="bold cyan")
     table.add_column("hardware")
@@ -161,7 +188,8 @@ def list_recipes() -> None:
     table.add_column("max $/hr", justify="right")
     table.add_column("est tok/s", justify="right")
     table.add_column("doc")
-    for r in recipe_mod.RECIPES.values():
+    table.add_column("from", style="dim")
+    for r in loaded.values():
         table.add_row(
             r.key,
             f"{r.num_gpus}x {r.gpu_name}",
@@ -169,9 +197,11 @@ def list_recipes() -> None:
             f"{r.max_dph:.2f}",
             r.est_tokps,
             r.doc_ref,
+            "builtin" if BUILTIN_DIR in r.source else "custom",
         )
     console.print(table)
     console.print("[dim]est tok/s are modelled (docs/METHOD.md §2) — `gpuctl bench` measures the truth.[/]")
+    console.print("[dim]`gpuctl recipes --paths` shows where these load from; `--show <key>` prints one.[/]")
 
 
 def _offer_table(offers: list[dict[str, Any]], title: str) -> Table:
@@ -208,7 +238,7 @@ def search(
     """Search Vast for offers matching a recipe."""
     try:
         r = recipe_mod.get(recipe)
-    except KeyError as exc:
+    except (KeyError, recipe_mod.RecipeError) as exc:
         _fail(str(exc))
     with _client() as c:
         try:
@@ -438,7 +468,7 @@ def up(
     """Rent a GPU box and start vLLM on it."""
     try:
         r = recipe_mod.get(recipe)
-    except KeyError as exc:
+    except (KeyError, recipe_mod.RecipeError) as exc:
         _fail(str(exc))
     if model:
         r = dataclasses.replace(r, model=model)
