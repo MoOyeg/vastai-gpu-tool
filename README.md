@@ -1,0 +1,194 @@
+# gpuctl
+
+Provision GPU boxes on [Vast.ai](https://vast.ai), track them from "rented" to
+"actually serving tokens", and wire them into [opencode](https://opencode.ai)
+the moment they are ready.
+
+Built for a specific question: **before buying GPUs to run a large model
+locally, rent the candidate configurations for an hour and measure them.** A few
+dollars of rental replaces a pile of estimates.
+
+The sizing and speed arithmetic is written up in [docs/METHOD.md](docs/METHOD.md).
+
+## Why it exists
+
+Renting is a metered activity, and the failure mode is not "it didn't work",
+it's "it worked and then billed for nine hours". So the design leans on three
+things:
+
+- **Every launch has a deadline.** `--ttl` is written into local state at rent
+  time, `gpuctl watch` enforces it, and `gpuctl reap` is cron-safe.
+- **Readiness means *serving*, not *running*.** A Vast container reports
+  `running` for many minutes while vLLM is still pulling 39 GB of weights.
+  `gpuctl` polls `/v1/models` and only calls it ready when a model answers.
+- **Teardown is symmetric.** `gpuctl down` destroys the instance *and* removes
+  the provider block it added to opencode, so you never point opencode at a
+  dead IP.
+
+## Install
+
+```bash
+uv venv --python 3.11
+uv pip install -e .
+export VAST_API_KEY=...        # or: uv run gpuctl set-key <key>
+uv run gpuctl doctor
+```
+
+Add your SSH public key at <https://cloud.vast.ai/manage-keys/> before renting —
+keys only attach to *new* instances.
+
+## Use
+
+```bash
+uv run gpuctl models                  # what can I serve, and what VRAM does it need
+uv run gpuctl plan                    # cheapest offer that fits each model
+uv run gpuctl plan llama70b -n 10     # alternatives for one model
+uv run gpuctl launch llama70b         # rent the cheapest fit, boot, wire into opencode
+uv run gpuctl ps                      # phase + spend so far
+uv run gpuctl bench                   # measured tok/s vs the doc's estimate
+uv run gpuctl down                    # stop the meter, unlink from opencode
+```
+
+`launch` picks hardware from the model: parallelism from the offer's GPU count
+(respecting vLLM's TP divisibility rule), context from what the VRAM allows,
+disk from the weight size. `up <recipe>` still runs the fixed presets.
+
+Useful guards: `--min-tokps 25` skips offers that fit but are too slow to use,
+`--exclude-geo ", CN"` avoids hosts that cannot reach HuggingFace, and `--ttl`
+sets the auto-destroy deadline.
+
+`gpuctl up` prints a spend plan and waits for confirmation before renting
+anything. Then it watches the instance through its phases and, on
+`serving`, writes the provider into `~/.config/opencode/opencode.json`:
+
+```
+pending → loading → running → serving → linked
+```
+
+## Recipes
+
+Each recipe is one configuration worth measuring before buying it
+([docs/METHOD.md §8](docs/METHOD.md)). `est tok/s` is the *prediction*;
+`gpuctl bench` produces the measurement to check it against.
+
+| key | hardware | model | doc |
+|---|---|---|---|
+| `smoke` | 1× RTX 3090 | Qwen2.5-7B-AWQ | pipeline test, pennies |
+| `build-a` | 2× RTX 3090, TP=2 | Llama-3.3-70B-AWQ | METHOD §8 |
+| `build-b` | 2× RTX 4090, TP=2 | Llama-3.3-70B-AWQ | METHOD §8 |
+| `build-f` | 4× RTX 3090, TP=4 | Llama-3.3-70B-AWQ | METHOD §8 |
+| `a6000` | 1× RTX A6000 48 GB | Llama-3.3-70B-AWQ | METHOD §3 |
+| `pro6000` | 1× RTX PRO 6000 96 GB | gpt-oss-120b | METHOD §6 |
+
+Override anything: `gpuctl up build-a --model <hf-id> --ttl 1 --max-dph 0.55`.
+
+## How the opencode wiring works
+
+opencode's provider schema takes an `npm` adapter plus a `baseURL`, which is
+the same shape as the local MLX/llama.cpp providers already in your config. A
+linked instance shows up as:
+
+```json
+"provider": {
+  "vast-1234567": {
+    "npm": "@ai-sdk/openai-compatible",
+    "name": "Vast 2x RTX 3090 (1234567)",
+    "options": {
+      "baseURL": "http://1.2.3.4:40021/v1",
+      "apiKey": "sk-vast-…",
+      "headerTimeout": 900000,
+      "chunkTimeout": 300000
+    },
+    "models": { "llama-3.3-70b-instruct-awq": { "tool_call": true, "limit": { … } } }
+  }
+}
+```
+
+The model id is read back from the instance's own `/v1/models` rather than
+assumed. The config file is backed up (`opencode.<epoch>.bak`) before every
+edit, and only providers prefixed `vast-` are ever touched. A config that
+isn't plain JSON is refused rather than rewritten.
+
+## Layout
+
+| file | role |
+|---|---|
+| `vast.py` | Vast REST client (`/bundles/`, `/asks/{id}/`, `/instances/`) |
+| `models.py` | model catalogue + VRAM/KV/TP arithmetic |
+| `planner.py` | fits models to live offers, cheapest first |
+| `recipes.py` | preset launch configurations |
+| `provision.py` | offer search, port/env mapping, vLLM onstart script |
+| `track.py` | phase state machine, cost accounting, link/unlink |
+| `health.py` | `/v1/models` readiness probe |
+| `opencode.py` | safe merge into opencode's config |
+| `state.py` | local record of intent: TTL, serving key, what we edited |
+
+## Measured results (2026-09-10)
+
+**Llama 3.3 70B AWQ, 2x RTX 5090 (TP=2, 32k ctx), $0.99/hr, Taiwan:**
+
+| metric | value |
+|---|---|
+| decode | **60.6 tok/s** (verified over 128/256/512-token runs, server-reported token counts) |
+| TTFT | ~500 ms |
+| ITL / TPOT | 17 ms |
+| doc §2 model predicted | ~29 tok/s |
+
+Two things this settles:
+
+- **`awq_marlin` engages** on current hardware. The log says
+  `Using MarlinLinearKernel for AutoAWQMarlinLinearMethod`, on Blackwell (sm_120).
+- **The conventional 40% TP=2 efficiency figure is far too harsh.** Back-solving from 60.6 tok/s
+  gives 67-84% depending on whether you use spec or Vast-measured bandwidth.
+  Whether Ampere reaches the same is a separate measurement — `gpuctl launch
+  llama70b --offer <a 3090 box>` answers it.
+
+## Serving gotchas (found the hard way, verified live 2026-09-10)
+
+These cost real debugging time, so they are written down:
+
+- **A vLLM server is not agent-ready just because `/v1/models` answers.**
+  Function calling requires BOTH `--enable-auto-tool-choice` and a matching
+  `--tool-call-parser`; without them opencode fails on its first request with
+  `"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser
+  to be set`. Every model and recipe now carries its parser, and
+  `health.tool_call_smoke()` asserts a real `tool_calls` response before we call
+  anything ready. Parser names move between releases — get them from
+  `vllm serve --help=all` (in 0.29 plain `--help` is an 80-line summary that
+  omits the flag entirely).
+- **`vllm/vllm-openai:latest` is CUDA 13.** Its NVIDIA forward-compatibility
+  libraries only work on *datacenter* GPUs, so a GeForce host on an older driver
+  dies with `CUDA error 804: forward compatibility was attempted on non
+  supported HW` — while Vast happily reports the instance as `running` with
+  `status_msg: "success"`. Recipes now require `cuda_max_good >= 13.0`.
+- **Cheap hardware that "fits" often cannot run the kernels.** AWQ Marlin and
+  bf16 need sm_80+, MXFP4 needs sm_90+. Without a compute-capability filter the
+  planner happily recommends a Tesla P40.
+
+- **`gpu_name` must contain spaces, not underscores.** `{"eq": "RTX_3090"}`
+  returns *zero offers with HTTP 200* — no error, just silence. The underscore
+  form is a CLI shell-quoting convention; Vast's own API docs example
+  (`["RTX_4090","RTX_3090"]`) is misleading. `gpuctl` now resolves every name
+  against `/gpu_names/unique/` and raises with suggestions rather than
+  returning an empty list.
+- **`GET /api/v0/instances/` is retired** — HTTP 410 `deprecated_endpoint`.
+  Listing moved to `/api/v1/instances/`. Single-instance `GET`, `PUT /asks/{id}/`
+  (create), `DELETE /instances/{id}/` and `request_logs` are all still v0.
+- **The API rate-limits bursts** (HTTP 429, ~5 requests/window) and returns a
+  `retry_after`. The client honours it with exponential-backoff fallback;
+  without this, a multi-config search or a tight `watch` trips it.
+- **GPU names are more specific than you expect.** There is no `RTX PRO 6000` —
+  it is `RTX PRO 6000 WS` / `S` / `Max-Q`. Check with `gpuctl gpus -f 6000`.
+
+## Notes
+
+- Vast injects sshd into any image, so `vllm/vllm-openai:latest` works with
+  `runtype: ssh` — you get both the server and a shell.
+- Container ports are requested through the env map (`"-p 8000:8000": "1"`)
+  and land on a *random* external port; `gpuctl` reads the real mapping out of
+  the instance's `ports` field.
+- The serving key is passed as `$VLLM_API_KEY` and referenced by name in the
+  onstart script, so the secret is not stored in Vast's onstart text.
+- Gated models need `--hf-token` (or `HF_TOKEN`).
+- GPU names differ by host. If a search comes back empty, check the exact
+  string with `gpuctl gpus -f 6000`.
