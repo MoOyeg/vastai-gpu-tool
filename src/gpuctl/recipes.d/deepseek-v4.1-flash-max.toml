@@ -1,0 +1,25 @@
+# DeepSeek V4.1 Flash (Reasoning, Max Effort) — needs vLLM >= 0.30.0, which has
+# no release tag yet, so a nightly image is required.
+# https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash
+title = "DeepSeek V4.1 Flash (max effort) — MLA + 384 experts"
+gpu_name = "H200"
+num_gpus = 8
+model = "deepseek-ai/DeepSeek-V4.1-Flash"
+tool_parser = "deepseek_v41"
+# DeepseekV41ForCausalLM is NOT registered in vLLM 0.29; :latest will refuse it.
+image = "vllm/vllm-openai:nightly"
+disk_gb = 750
+max_dph = 55.00
+min_inet_down = 1000
+min_cuda = 13.0
+est_tokps = "?"
+doc_ref = "METHOD §7"
+notes = "510.3 GB fp8 weights; the recipe states vram_minimum_gb 614, which an 8x H200 node (1123 GiB) clears. 40 layers, MLA (1 KV head, head_dim 512), 384 experts with 6 active. Max effort is reasoning_effort 100 (low=25, high=50, xhigh=75); with both keys unset thinking is ON at 50, which quietly eats the token budget. --tokenizer-mode deepseek_v41 is mandatory. The official AMD command also passes --moe-backend aiter and --language-model-only; both are ROCm-specific and deliberately omitted here."
+vllm_args = [
+  "--tensor-parallel-size", "8",
+  "--tokenizer-mode", "deepseek_v41",
+  "--max-model-len", "262144",
+  "--gpu-memory-utilization", "0.92",
+  "--reasoning-parser", "deepseek_v41",
+  "--default-chat-template-kwargs", "'{\"thinking\":true,\"reasoning_effort\":100}'",
+]

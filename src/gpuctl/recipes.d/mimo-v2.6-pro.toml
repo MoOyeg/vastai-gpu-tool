@@ -1,0 +1,22 @@
+# MiMo-V2.6-Pro — official recipe: 8x H200 (TP8) or >= 680 GB aggregate VRAM.
+# https://recipes.vllm.ai/XiaomiMiMo/MiMo-V2.6-Pro-RL
+title = "MiMo-V2.6-Pro — 384-expert MoE, hybrid SWA"
+gpu_name = "H200"
+num_gpus = 8
+model = "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+tool_parser = "mimo"
+disk_gb = 800
+max_dph = 55.00
+min_inet_down = 1000
+min_cuda = 13.0
+est_tokps = "?"
+doc_ref = "METHOD §7"
+notes = "566.0 GB weights / 70 layers / 384 experts, 8 active. Hybrid attention: only 10 of 70 layers are full attention, the rest are sliding-window (chunk 128), so real KV is far below what a uniform GQA estimate suggests. Flags follow the official recipe verbatim, including --max-model-len auto and --generation-config vllm."
+vllm_args = [
+  "--tensor-parallel-size", "8",
+  "--trust-remote-code",
+  "--gpu-memory-utilization", "0.95",
+  "--max-model-len", "auto",
+  "--reasoning-parser", "mimo",
+  "--generation-config", "vllm",
+]

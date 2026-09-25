@@ -1,0 +1,22 @@
+# Qwen3.8 27B (xhigh) — the only one of this set that is cheap to host.
+# Flags from the official vLLM recipe: https://recipes.vllm.ai/Qwen/Qwen3.8-27B
+title = "Qwen3.8 27B (xhigh) — dense, FP8"
+gpu_name = "RTX 5090"
+num_gpus = 2
+model = "Qwen/Qwen3.8-27B-FP8"
+tool_parser = "qwen3_xml"
+disk_gb = 90
+max_dph = 2.20
+min_inet_down = 500
+min_cuda = 13.0
+est_tokps = "~55-80"
+doc_ref = "METHOD §7"
+notes = "FP8 weights are 30.9 GB; 64 layers x 4 KV heads x head_dim 256 = 256 KiB/token at fp16, so fp8 KV is what makes long context affordable. reasoning_effort xhigh is Qwen3.8's own default; it is pinned here so the setting is explicit and reproducible."
+vllm_args = [
+  "--tensor-parallel-size", "2",
+  "--max-model-len", "131072",
+  "--kv-cache-dtype", "fp8",
+  "--gpu-memory-utilization", "0.92",
+  "--reasoning-parser", "qwen3",
+  "--default-chat-template-kwargs", "'{\"reasoning_effort\":\"xhigh\"}'",
+]

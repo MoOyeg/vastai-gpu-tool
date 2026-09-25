@@ -1,0 +1,27 @@
+# Kimi K3 (max) — 1560.9 GB of bf16 weights. Needs a full 8-GPU Blackwell Ultra
+# node; the official recipe states "at least 8x GB300".
+# https://recipes.vllm.ai/moonshotai/Kimi-K3
+title = "Kimi K3 (max reasoning) — 896-expert MoE"
+gpu_name = "B300"
+num_gpus = 8
+model = "moonshotai/Kimi-K3"
+tool_parser = "kimi_k3"
+# Kimi K3 ships in its own image; :latest cannot serve it.
+image = "vllm/vllm-openai:kimi-k3"
+disk_gb = 2300
+max_dph = 95.00
+min_inet_down = 1000
+min_cuda = 13.0
+# The market usually holds a single 8x B300 offer, currently at 96.9% — the
+# default 0.97 floor would reject the only host capable of running this.
+min_reliability = 0.95
+est_tokps = "?"
+doc_ref = "METHOD §7"
+notes = "1560.9 GB weights / 93 layers / 896 experts, 16 active + 2 shared. MLA (kv_lora_rank 512) plus KDA linear attention on 69 of 93 layers, so KV is small for the size. The recipe page also suggests the TOKENSPEED_MLA attention backend and deep_gemm_mega_moe, and TEP16 or TP8xPP2 as alternatives to TP8 — none are set here because the page gives no verbatim flag spellings. Verify with `gpuctl logs` on first launch."
+vllm_args = [
+  "--tensor-parallel-size", "8",
+  "--max-model-len", "262144",
+  "--gpu-memory-utilization", "0.92",
+  "--reasoning-parser", "kimi_k3",
+  "--trust-remote-code",
+]

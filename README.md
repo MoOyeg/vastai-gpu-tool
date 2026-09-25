@@ -92,6 +92,18 @@ est_tokps  = "~60 (measured)"
 vllm_args  = ["--tensor-parallel-size", "2", "--max-model-len", "32768"]
 ```
 
+Frontier-model recipes take their flags from the **official vLLM recipes**
+(`recipes.vllm.ai/<org>/<model>`) rather than from guesswork — including the
+mandatory ones that are easy to miss, like MiniMax-M3's `--block-size 128` and
+DeepSeek V4.1's `--tokenizer-mode deepseek_v41`.
+
+Reasoning effort (`xhigh`, max) is **not a serve flag** — it is a per-request
+`chat_template_kwargs` value, pinned server-wide here via
+`--default-chat-template-kwargs`. Two models need a non-default container:
+Kimi K3 ships as `vllm/vllm-openai:kimi-k3`, and DeepSeek V4.1 Flash needs
+vLLM ≥ 0.30 (`DeepseekV41ForCausalLM` is not registered in 0.29), so it pins
+`:nightly`. `gpuctl up` highlights a non-default image in the spend plan.
+
 `model_key` points at the model catalogue (`gpuctl models`) so a recipe inherits
 the HuggingFace id and — importantly — the right `--tool-call-parser`. Set
 `model` and `tool_parser` directly instead for anything not in the catalogue.
@@ -106,6 +118,11 @@ Each recipe is one configuration worth measuring before buying it
 | key | hardware | model | doc |
 |---|---|---|---|
 | `smoke` | 1× RTX 3090 | Qwen2.5-7B-AWQ | pipeline test, pennies |
+| `qwen3.8-27b` | 2× RTX 5090 | Qwen3.8-27B-FP8 | ~$1.0/hr — frontier reasoning, cheap |
+| `mimo-v2.6-pro` | 8× H200 | MiMo-V2.6-Pro-RL | ~$48/hr |
+| `minimax-m3` | 8× H200 | MiniMax-M3 | ~$49/hr |
+| `deepseek-v4.1-flash-max` | 8× H200 | DeepSeek-V4.1-Flash | ~$48/hr, needs a nightly image |
+| `kimi-k3-max` | 8× B300 | Kimi-K3 | ~$86/hr |
 | `build-a` | 2× RTX 3090, TP=2 | Llama-3.3-70B-AWQ | METHOD §8 |
 | `build-b` | 2× RTX 4090, TP=2 | Llama-3.3-70B-AWQ | METHOD §8 |
 | `build-f` | 4× RTX 3090, TP=4 | Llama-3.3-70B-AWQ | METHOD §8 |

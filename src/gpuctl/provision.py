@@ -45,7 +45,10 @@ def offer_summary(offer: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_env(*, port: int, serve_key: str, hf_token: str | None = None) -> dict[str, str]:
+def build_env(
+    *, port: int, serve_key: str, hf_token: str | None = None,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Vast's env map doubles as the Docker run-options map.
 
     A key of "-p 8000:8000" (value "1") is how a container port is requested;
@@ -58,6 +61,8 @@ def build_env(*, port: int, serve_key: str, hf_token: str | None = None) -> dict
     }
     if hf_token:
         env["HF_TOKEN"] = hf_token
+    if extra:
+        env.update(extra)
     return env
 
 
@@ -106,11 +111,14 @@ def launch(
     hf_token: str | None = None,
     extra_args: list[str] | None = None,
     label: str | None = None,
-    image: str = "vllm/vllm-openai:latest",
+    image: str | None = None,
 ) -> Deployment:
     offer_id = int(offer["id"])
     serve_key = new_serve_key()
-    env = build_env(port=port, serve_key=serve_key, hf_token=hf_token)
+    # A recipe may pin its own image; only fall back to the default if it did not.
+    image = image or recipe.image
+    env = build_env(port=port, serve_key=serve_key, hf_token=hf_token,
+                    extra=recipe.extra_env)
     onstart = build_onstart(recipe, port=port, extra_args=extra_args)
     label = label or f"gpuctl/{recipe.key}"
 

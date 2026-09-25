@@ -103,6 +103,69 @@ def test_search_query_uses_spaces_not_underscores():
     assert q["cuda_max_good"]["gte"] >= 13.0   # CUDA 13 image; see docs/METHOD.md §6
 
 
+def test_reliability_floor_is_configurable(recipe_dir):
+    """Scarce hardware may have exactly one offer; the floor must be relaxable."""
+    write(recipe_dir, "scarce.toml", VALID + "min_reliability = 0.90\n")
+    assert recipes.get("scarce").search_query()["reliability"]["gte"] == 0.90
+    assert recipes.get("build-a").search_query()["reliability"]["gte"] == 0.97
+
+
+def test_reliability_must_be_a_fraction(recipe_dir):
+    write(recipe_dir, "bad.toml", VALID + "min_reliability = 97\n")
+    with pytest.raises(recipes.RecipeError, match="fraction between 0 and 1"):
+        recipes.all_recipes()
+
+
+def test_recipe_can_pin_its_own_image(recipe_dir):
+    """Kimi K3 ships in its own image; :latest cannot serve it."""
+    write(recipe_dir, "pinned.toml", VALID + 'image = "vllm/vllm-openai:kimi-k3"\n')
+    assert recipes.get("pinned").image == "vllm/vllm-openai:kimi-k3"
+    assert recipes.get("build-a").image == "vllm/vllm-openai:latest"
+
+
+def test_extra_env_reaches_the_container(recipe_dir):
+    write(recipe_dir, "envy.toml", VALID + '\n[extra_env]\nVLLM_FLOAT32_MATMUL_PRECISION = "high"\n')
+    env = provision.build_env(port=8000, serve_key="k",
+                              extra=recipes.get("envy").extra_env)
+    assert env["VLLM_FLOAT32_MATMUL_PRECISION"] == "high"
+    assert env["-p 8000:8000"] == "1", "port request must survive the merge"
+
+
+def test_shipped_reasoning_recipes_are_coherent():
+    """The frontier-model recipes must carry their parsers and a sane image."""
+    expect = {
+        "qwen3.8-27b": ("qwen3_xml", "qwen3", "vllm/vllm-openai:latest"),
+        "kimi-k3-max": ("kimi_k3", "kimi_k3", "vllm/vllm-openai:kimi-k3"),
+        "mimo-v2.6-pro": ("mimo", "mimo", "vllm/vllm-openai:latest"),
+        "minimax-m3": ("minimax_m3", "minimax_m3", "vllm/vllm-openai:latest"),
+        "deepseek-v4.1-flash-max": ("deepseek_v41", "deepseek_v41", "vllm/vllm-openai:nightly"),
+    }
+    for key, (tool, reasoning, image) in expect.items():
+        r = recipes.get(key)
+        assert r.tool_parser == tool, key
+        assert r.image == image, key
+        args = r.vllm_args
+        assert "--reasoning-parser" in args, key
+        assert args[args.index("--reasoning-parser") + 1] == reasoning, key
+        onstart = provision.build_onstart(r, port=8000)
+        assert f"--tool-call-parser {tool}" in onstart, key
+        assert len(onstart) <= provision.ONSTART_LIMIT, key
+
+
+def test_minimax_keeps_its_mandatory_block_size():
+    """--block-size 128 is mandatory on every platform for MiniMax-M3."""
+    args = recipes.get("minimax-m3").vllm_args
+    assert args[args.index("--block-size") + 1] == "128"
+
+
+def test_json_chat_template_kwargs_survive_shell_quoting():
+    """The JSON must reach vllm as one argument, not get split by bash."""
+    for key in ("qwen3.8-27b", "deepseek-v4.1-flash-max"):
+        onstart = provision.build_onstart(recipes.get(key), port=8000)
+        assert "--default-chat-template-kwargs '{" in onstart, key
+        assert onstart.count("'") % 2 == 0, f"{key}: unbalanced quotes"
+
+
 def test_unknown_recipe_lists_alternatives():
     with pytest.raises(KeyError) as exc:
         recipes.get("does-not-exist")

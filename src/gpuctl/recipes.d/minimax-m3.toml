@@ -1,0 +1,21 @@
+# MiniMax-M3 — official recipe: 8x H200/H20 for a tight single-node BF16 fit.
+# https://recipes.vllm.ai/MiniMaxAI/MiniMax-M3
+title = "MiniMax-M3 — 128-expert MoE, 1M context"
+gpu_name = "H200"
+num_gpus = 8
+model = "MiniMaxAI/MiniMax-M3"
+tool_parser = "minimax_m3"
+disk_gb = 1100
+max_dph = 55.00
+min_inet_down = 1000
+min_cuda = 13.0
+est_tokps = "?"
+doc_ref = "METHOD §7"
+notes = "854.2 GB bf16 weights / 60 layers / 128 experts, 4 active. --block-size 128 is MANDATORY on every platform for MSA sparse/index cache compatibility — do not remove it. An NVFP4 variant (nvidia/MiniMax-M3-NVFP4, 250.1 GB) also exists and needs VLLM_FLOAT32_MATMUL_PRECISION=high plus --trust-remote-code."
+vllm_args = [
+  "--tensor-parallel-size", "8",
+  "--block-size", "128",
+  "--max-model-len", "131072",
+  "--gpu-memory-utilization", "0.92",
+  "--reasoning-parser", "minimax_m3",
+]

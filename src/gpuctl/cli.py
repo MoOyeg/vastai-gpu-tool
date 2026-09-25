@@ -510,6 +510,10 @@ def up(
         plan.add_row("hardware", f"{s['gpu']}  ({s['geo']})")
         plan.add_row("offer", f"{s['id']}  rel {s['reliability'] * 100:.1f}%  net ↓{s['inet_down']:.0f} Mbps")
         plan.add_row("model", r.model)
+        if r.image != recipe_mod.Recipe.image:
+            plan.add_row("image", f"[yellow]{r.image}[/]  [dim](not the default)[/]")
+        if r.extra_env:
+            plan.add_row("env", " ".join(f"{k}={v}" for k, v in r.extra_env.items()))
         plan.add_row("disk", f"{disk_gb} GB")
         plan.add_row("price", f"[bold]{_money(s['dph'])}/hr[/]")
         plan.add_row(

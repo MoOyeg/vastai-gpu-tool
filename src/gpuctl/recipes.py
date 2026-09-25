@@ -48,11 +48,20 @@ class Recipe:
     min_inet_down: int = 400          # Mbps; a 39 GB pull dominates cold start
     min_gpu_ram_mb: int | None = None
     min_cuda: float = 13.0   # vllm/vllm-openai:latest is CUDA 13; see planner.MIN_CUDA_FOR_LATEST
+    # Host reliability floor. Worth relaxing for scarce, expensive hardware where
+    # the market may hold a single offer — a 0.1% shortfall should not make a
+    # recipe unusable.
+    min_reliability: float = 0.97
     est_tokps: str = "?"
     doc_ref: str = ""
     notes: str = ""
     query_extra: dict[str, Any] = field(default_factory=dict)
     tool_parser: str = ""   # see models.Model.tool_parser — required for agent clients
+    # Some models need a specific image: Kimi K3 ships as vllm/vllm-openai:kimi-k3,
+    # and anything needing vLLM >= 0.30 has no release tag yet (nightly only).
+    image: str = "vllm/vllm-openai:latest"
+    # Extra container env vars, e.g. VLLM_FLOAT32_MATMUL_PRECISION=high.
+    extra_env: dict[str, Any] = field(default_factory=dict)
     source: str = ""        # where this recipe was loaded from, for provenance
 
     @property
@@ -74,7 +83,7 @@ class Recipe:
             "dph_total": {"lte": float(max_dph if max_dph is not None else self.max_dph)},
             "disk_space": {"gte": float(self.disk_gb)},
             "inet_down": {"gte": float(self.min_inet_down)},
-            "reliability": {"gte": 0.97},
+            "reliability": {"gte": float(self.min_reliability)},
             # A GeForce host on an older driver dies with CUDA error 804:
             # the image's forward-compat libs only work on datacenter GPUs.
             "cuda_max_good": {"gte": float(self.min_cuda)},
@@ -97,8 +106,9 @@ _SUGAR = {"model_key"}
 # Recipes are hand-written files now, so types are checked on the way in rather
 # than left to fail later as a string in a Vast query or a format specifier.
 _INT_FIELDS = {"num_gpus", "disk_gb", "min_inet_down", "min_gpu_ram_mb"}
-_FLOAT_FIELDS = {"max_dph", "min_cuda"}
-_STR_FIELDS = {"title", "gpu_name", "model", "est_tokps", "doc_ref", "notes", "tool_parser"}
+_FLOAT_FIELDS = {"max_dph", "min_cuda", "min_reliability"}
+_STR_FIELDS = {"title", "gpu_name", "model", "est_tokps", "doc_ref", "notes",
+               "tool_parser", "image"}
 
 
 def _coerce(name: str, value: Any, source: str) -> Any:
@@ -136,6 +146,10 @@ def _coerce(name: str, value: Any, source: str) -> Any:
                 raise RecipeError(f"{where} contains a non-string entry {item!r}")
             out.append(str(item))
         return out
+    if name == "extra_env":
+        if not isinstance(value, dict):
+            raise RecipeError(f"{where} must be a table of NAME = \"value\", got {value!r}")
+        return {str(k): str(v) for k, v in value.items()}
     if name == "query_extra":
         if not isinstance(value, dict):
             raise RecipeError(f"{where} must be a table, got {value!r}")
@@ -188,6 +202,8 @@ def _from_mapping(key: str, data: dict[str, Any], source: str) -> Recipe:
         raise RecipeError(f"{source}: num_gpus must be at least 1")
     if "max_dph" in data and data["max_dph"] <= 0:
         raise RecipeError(f"{source}: max_dph must be greater than 0")
+    if "min_reliability" in data and not 0.0 <= data["min_reliability"] <= 1.0:
+        raise RecipeError(f"{source}: min_reliability must be a fraction between 0 and 1")
 
     missing = [f for f in _REQUIRED if not data.get(f)]
     if missing:
