@@ -28,6 +28,49 @@ things:
   wedges while nobody is watching — it bills at full rate and looks exactly
   like one that is merely slow. See below.
 
+## Accounting
+
+`gpuctl ledger` keeps a running account of every box rented — whether it ever
+served, how long it billed, and what that cost.
+
+```
+$ gpuctl ledger
+│ 50546033 │ llama70b    │ 2x RTX 5090        │ 57m35s │ served       │ 0.993 │ $0.95 │
+│ 52523991 │ qwen3.8-27b │ 2x RTX 5090        │ 1h16m  │ never served │ 0.985 │ $1.25 │
+…
+ instances                6 rented — 2 served, 4 never did  (33% success)
+ total spend              $3.67
+   on boxes that served   $1.57
+   on boxes that did not  $2.10  (57% of spend)
+ cost per working box     $1.84
+
+Vast credit remaining $20.79 of $25.00 added → $4.21 actually spent
+```
+
+`--json` for scripting, `--limit N` for the most recent few.
+
+**"Cost per working box" is the number that matters.** It divides *all* spend by
+the boxes that actually served, so failed rentals are priced in — a marketplace
+of independent hosts produces plenty of them.
+
+Cost is an estimate: billable hours × the rate agreed at launch. Vast exposes no
+per-instance charge rows (its invoice feed carries payments and aggregated
+billing), so there is nothing authoritative to read back per contract. Instead
+the *total* is reconciled against the account balance, which Vast will confirm —
+in the run above the estimate came in $0.54 under, because Vast bills storage
+separately and keeps charging for disk on stopped instances.
+
+Two things the accounting needed fixing for:
+
+- **The cost clock never stopped.** `accrued_cost()` was `now - created_at` with
+  no upper bound, so a box that ran 34 minutes reported **$353** of spend two
+  weeks later. It now clamps at teardown and freezes the final figure.
+- **Teardown erased the evidence of success.** `unlink_opencode` clears
+  `linked_at`, since that means *currently* linked — which left no record that a
+  box had ever served. `served_at` is now recorded on the first successful probe
+  and never cleared, with `notes["linked_model_id"]` as the witness for records
+  written before it existed.
+
 ## Catching a hang
 
 A vLLM process can load its weights and then wedge: container `running`, Vast

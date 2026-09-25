@@ -16,6 +16,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import conductor as conductor_mod
+from . import ledger as ledger_mod
 from . import models as model_mod, opencode, planner, provision, recipes as recipe_mod, state
 from .config import (
     DEFAULT_DISK_GB,
@@ -659,7 +660,7 @@ def _watch_loop(dep: Deployment, *, interval: float, set_default: bool, reap: bo
                               f"inspect with `gpuctl logs {dep.instance_id}`[/]")
                 if on_stall == "destroy":
                     console.print("[yellow]--on-stall destroy:[/] destroying it now.")
-                    _destroy(c, fresh)
+                    _destroy(c, fresh, reason="stalled")
                 else:
                     console.print(f"[dim]`gpuctl down {dep.instance_id}` to stop the meter, "
                                   f"or re-run watch to keep waiting.[/]")
@@ -672,7 +673,7 @@ def _watch_loop(dep: Deployment, *, interval: float, set_default: bool, reap: bo
 
             if reap and fresh.expired():
                 console.print(f"[bold red]TTL reached[/] — destroying {dep.instance_id} to stop the meter.")
-                _destroy(c, fresh)
+                _destroy(c, fresh, reason="ttl")
                 break
 
             time.sleep(interval)
@@ -880,6 +881,130 @@ def ssh(
     console.print(" ".join(cmd))
 
 
+# ----------------------------------------------------------------- ledger
+
+
+@app.command()
+def ledger(
+    limit: int = typer.Option(0, "--limit", "-n", help="show only the most recent N (0 = all)"),
+    as_json: bool = typer.Option(False, "--json", help="machine-readable output"),
+    reconcile: bool = typer.Option(True, "--reconcile/--no-reconcile",
+                                   help="cross-check the total against your Vast balance"),
+) -> None:
+    """Running account: every instance rented, whether it served, and what it cost."""
+    deps = state.load_all(include_destroyed=True)
+    if not deps:
+        console.print("[dim]nothing rented yet.[/]")
+        return
+    deps.sort(key=lambda d: d.created_at)
+    shown = deps[-limit:] if limit else deps
+    summary = ledger_mod.summarise(deps)
+
+    check = None
+    if reconcile:
+        try:
+            with _client() as client:
+                check = ledger_mod.reconcile(client)
+        except (ConfigError, VastError):
+            check = None
+
+    if as_json:
+        import json as _json
+
+        console.print(_json.dumps({
+            "instances": [{
+                "instance_id": d.instance_id, "recipe": d.recipe, "model": d.model,
+                "gpu": d.gpu_label, "created_at": d.created_at,
+                "destroyed_at": d.destroyed_at, "ran_hours": round(d.age_hours(), 4),
+                "served": d.succeeded,
+                "time_to_serve_s": round(d.time_to_serve) if d.time_to_serve else None,
+                "outcome": d.outcome, "dph": d.dph_at_launch,
+                "cost": round(d.accrued_cost(), 4),
+            } for d in shown],
+            "summary": {
+                "launched": summary.launched, "served": summary.served,
+                "failed": summary.failed, "success_rate": summary.success_rate,
+                "total_cost": round(summary.total_cost, 4),
+                "cost_served": round(summary.cost_served, 4),
+                "cost_wasted": round(summary.cost_wasted, 4),
+                "runtime_hours": round(summary.runtime_hours, 4),
+                "live": summary.live, "live_dph": summary.live_dph,
+                "median_time_to_serve_s": (round(summary.median_time_to_serve)
+                                           if summary.median_time_to_serve else None),
+                "cost_per_working_box": (round(summary.mean_cost_per_success, 4)
+                                         if summary.mean_cost_per_success else None),
+            },
+            "vast_account": (None if not check else {
+                "credit_remaining": round(check.credit_remaining, 4),
+                "credits_added": check.credits_added,
+                "actual_spend": (round(check.actual_spend, 4)
+                                 if check.actual_spend is not None else None),
+            }),
+        }, indent=2))
+        return
+
+    table = Table(title="gpuctl ledger", header_style="bold")
+    table.add_column("instance", style="bold")
+    table.add_column("recipe")
+    table.add_column("gpu")
+    table.add_column("started", style="dim")
+    table.add_column("ran", justify="right")
+    table.add_column("to serve", justify="right")
+    table.add_column("outcome")
+    table.add_column("$/hr", justify="right", style="dim")
+    table.add_column("cost", justify="right", style="bold")
+    for d in shown:
+        tts = d.time_to_serve
+        table.add_row(
+            str(d.instance_id), d.recipe, d.gpu_label or "?",
+            time.strftime("%m-%d %H:%M", time.localtime(d.created_at)),
+            _dur(d.ran_seconds()),
+            _dur(tts) if tts else "—",
+            Text(d.outcome, style="green" if d.succeeded else "red"),
+            f"{d.dph_at_launch:.3f}",
+            _money(d.accrued_cost()),
+        )
+    console.print(table)
+
+    body = Table(box=None, pad_edge=False)
+    body.add_column(style="dim")
+    body.add_column()
+    rate = summary.success_rate
+    body.add_row("instances", f"{summary.launched} rented — "
+                              f"[green]{summary.served} served[/], [red]{summary.failed} never did[/]"
+                              + (f"  ({rate:.0%} success)" if rate is not None else ""))
+    body.add_row("runtime", f"{summary.runtime_hours:.2f} GPU-hours billed")
+    body.add_row("total spend", f"[bold]{_money(summary.total_cost)}[/]")
+    if summary.launched != summary.served:
+        frac = summary.wasted_fraction
+        body.add_row("  on boxes that served", _money(summary.cost_served))
+        body.add_row("  on boxes that did not", f"[red]{_money(summary.cost_wasted)}[/]"
+                     + (f"  ({frac:.0%} of spend)" if frac is not None else ""))
+    if summary.mean_cost_per_success:
+        body.add_row("cost per working box", _money(summary.mean_cost_per_success)
+                     + "  [dim](total spend ÷ boxes that served)[/]")
+    if summary.median_time_to_serve:
+        body.add_row("median time to serve", _dur(summary.median_time_to_serve))
+    if summary.live:
+        body.add_row("live now", f"[yellow]{summary.live} instance(s) billing "
+                                 f"{_money(summary.live_dph)}/hr[/]")
+    console.print(Panel(body, title="summary", border_style="cyan"))
+
+    if check:
+        line = f"Vast credit remaining [bold]{_money(check.credit_remaining)}[/]"
+        actual = check.actual_spend
+        if actual is not None:
+            drift = actual - summary.total_cost
+            line += (f" of {_money(check.credits_added)} added → "
+                     f"[bold]{_money(actual)}[/] actually spent")
+            line += (f"\n[dim]our estimate is {_money(abs(drift))} "
+                     f"{'under' if drift > 0 else 'over'}; Vast bills storage separately "
+                     f"and keeps charging for disk on stopped instances.[/]")
+        console.print(line)
+    console.print("[dim]cost = billable hours × the rate agreed at launch; Vast exposes no "
+                  "per-instance charge rows to read back.[/]")
+
+
 # ------------------------------------------------------------ down / reap
 
 
@@ -894,7 +1019,7 @@ def _apply_conductor(dep: Deployment) -> None:
                   f"[dim]  (was {edit.previous.get('default') or 'unset'})[/]")
 
 
-def _destroy(client: VastClient, dep: Deployment) -> None:
+def _destroy(client: VastClient, dep: Deployment, reason: str = "manual") -> None:
     try:
         client.destroy_instance(dep.instance_id)
     except VastError as exc:
@@ -906,7 +1031,7 @@ def _destroy(client: VastClient, dep: Deployment) -> None:
             console.print("[dim]reverted Conductor's model setting.[/]")
     except conductor_mod.ConductorError as exc:
         err.print(f"[yellow]could not revert Conductor:[/] {exc}")
-    dep.destroyed_at = time.time()
+    dep.close(reason)
     state.save(dep)
 
 
@@ -956,7 +1081,7 @@ def reap(
         if not yes and not typer.confirm(f"{dep.instance_id} is {why}. Destroy?", default=True):
             continue
         with _client() as c:
-            _destroy(c, dep)
+            _destroy(c, dep, reason="stalled" if "stalled" in why else "ttl")
         console.print(f"[green]reaped[/] {dep.instance_id} — {why} (~{_money(dep.accrued_cost())} spent)")
 
 

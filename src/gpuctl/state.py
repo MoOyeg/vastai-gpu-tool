@@ -45,7 +45,10 @@ class Deployment:
     conductor_prev: dict[str, Any] = field(default_factory=dict)
     endpoint: str = ""
     linked_at: float | None = None
+    served_at: float | None = None   # first time /v1/models answered — the success marker
     destroyed_at: float | None = None
+    final_cost: float | None = None  # spend frozen at teardown
+    end_reason: str = ""             # manual | ttl | stalled | error
     notes: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -61,16 +64,75 @@ class Deployment:
             return False
         return (now or time.time()) >= self.deadline
 
+    def ran_seconds(self, now: float | None = None) -> float:
+        """Billable lifetime: creation until teardown, or until now if still up.
+
+        The clamp matters. Without it a destroyed instance keeps accruing
+        forever — a box that ran 34 minutes was reporting $353 of spend two
+        weeks later.
+        """
+        end = self.destroyed_at or (now or time.time())
+        return max(0.0, end - self.created_at)
+
     def age_hours(self, now: float | None = None) -> float:
-        return max(0.0, ((now or time.time()) - self.created_at) / 3600.0)
+        return self.ran_seconds(now) / 3600.0
 
     def accrued_cost(self, now: float | None = None) -> float:
-        """Best-effort spend estimate from our own launch clock.
+        """Spend estimate: billable hours x the rate agreed at launch.
 
-        Vast bills from when the instance is created, including the image
-        download, so this intentionally counts provisioning time too.
+        Vast bills from creation, including the image download, so provisioning
+        time counts. Once torn down the figure is frozen in `final_cost` so the
+        ledger stays stable.
         """
+        if self.final_cost is not None:
+            return self.final_cost
         return self.age_hours(now) * self.dph_at_launch
+
+    @property
+    def first_served_at(self) -> float | None:
+        """When the model first answered.
+
+        `linked_at` is a sound fallback for records written before `served_at`
+        existed: a deployment is only ever linked into opencode *after* its
+        /v1/models probe succeeded, so a link timestamp proves it served.
+        """
+        return self.served_at or self.linked_at
+
+    @property
+    def succeeded(self) -> bool:
+        """Did this instance ever actually serve a model?
+
+        `notes["linked_model_id"]` is the durable witness. It is written only by
+        link_opencode, which runs only after a /v1/models probe succeeded — and
+        unlike `linked_at`, teardown does not clear it. (Teardown *does* clear
+        linked_at, since that means "currently linked", which is why it cannot
+        be the sole record.)
+        """
+        return (self.first_served_at is not None
+                or bool(self.notes.get("linked_model_id")))
+
+    @property
+    def time_to_serve(self) -> float | None:
+        """Seconds from renting to the model answering — provisioning latency."""
+        served = self.first_served_at
+        if served is None:
+            return None
+        return max(0.0, served - self.created_at)
+
+    @property
+    def outcome(self) -> str:
+        if not self.destroyed_at:
+            return "serving" if self.succeeded else "starting"
+        if self.succeeded:
+            return "served"
+        return f"never served ({self.end_reason})" if self.end_reason else "never served"
+
+    def close(self, reason: str, now: float | None = None) -> None:
+        """Freeze the record at teardown."""
+        now = now or time.time()
+        self.destroyed_at = now
+        self.final_cost = self.ran_seconds(now) / 3600.0 * self.dph_at_launch
+        self.end_reason = reason
 
 
 def new_serve_key() -> str:

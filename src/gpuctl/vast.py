@@ -214,6 +214,18 @@ class VastClient:
     def destroy_instance(self, instance_id: int) -> dict[str, Any]:
         return self._request("DELETE", f"/instances/{instance_id}/", json={})
 
+    # ------------------------------------------------------------- billing
+
+    def account(self) -> dict[str, Any]:
+        """Current user record, including the `credit` balance."""
+        return self._request("GET", "/users/current/")
+
+    def invoices(self) -> list[dict[str, Any]]:
+        """Payment and billing rows. Note: no per-instance charge rows exist."""
+        data = self._request("GET", "/users/current/invoices/")
+        rows = data.get("invoices", data) if isinstance(data, dict) else data
+        return rows if isinstance(rows, list) else []
+
     def logs(self, instance_id: int, tail: int = 200) -> str:
         data = self._request(
             "PUT", f"/instances/request_logs/{instance_id}/", json={"tail": str(tail)}

@@ -290,6 +290,10 @@ def _observe(client: VastClient, dep: Deployment, *, deep: bool = True) -> Snaps
 
     p = probe(endpoint, dep.serve_key)
     if p.serving:
+        if dep.served_at is None:
+            # First confirmed serve: the success marker for the ledger.
+            dep.served_at = time.time()
+            save(dep)
         phase = Phase.LINKED if dep.linked_at else Phase.SERVING
         return Snapshot(dep, phase, inst, endpoint, p, ", ".join(p.model_ids), cost)
 
