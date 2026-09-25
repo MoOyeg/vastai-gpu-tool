@@ -154,6 +154,7 @@ isn't plain JSON is refused rather than rewritten.
 | `track.py` | phase state machine, cost accounting, link/unlink |
 | `health.py` | `/v1/models` readiness probe |
 | `opencode.py` | safe merge into opencode's config |
+| `conductor.py` | comment-preserving edits to Conductor's settings.toml |
 | `state.py` | local record of intent: TTL, serving key, what we edited |
 
 ## Measured results (2026-09-10)
@@ -213,10 +214,48 @@ These cost real debugging time, so they are written down:
 - **GPU names are more specific than you expect.** There is no `RTX PRO 6000` —
   it is `RTX PRO 6000 WS` / `S` / `Max-Q`. Check with `gpuctl gpus -f 6000`.
 
+## Conductor
+
+[Conductor](https://conductor.build) runs OpenCode as a harness and *"asks
+OpenCode for the models available to your provider configuration"* — so a
+deployment gpuctl has linked into `opencode.json` already shows up in
+Conductor's model picker. What remains is telling Conductor to use it:
+
+```bash
+uv run gpuctl launch llama70b --conductor   # set it once the box is serving
+uv run gpuctl conductor                    # show current settings + liveness
+uv run gpuctl conductor set 50546033        # point it at a linked deployment
+uv run gpuctl conductor set --review        # also set the code-review model
+uv run gpuctl conductor revert              # put back what was there before
+```
+
+`--conductor` also works on `up`, `watch` and `link`. `gpuctl down` reverts
+automatically, so Conductor is never left pointing at a destroyed instance —
+and `gpuctl conductor` flags it loudly if something else left it that way.
+
+The written value is the provider-qualified id Conductor expects, which is the
+same one opencode uses:
+
+```toml
+[models]
+default = "vast-50546033/llama-3.3-70b-instruct-awq"
+```
+
+**On editing someone else's config file.** `tomllib` is read-only, and
+re-serialising with a TOML writer would discard the comments, key order and
+quoting style of a file you maintain by hand. So gpuctl makes a surgical
+single-line edit to the text, preserving standalone *and* inline comments, then
+verifies the result by re-parsing it and diffing against the expected document —
+if anything but the requested key moved, the write is abandoned. Only
+`models.default` and `models.review` are ever touched, a `.bak` is written
+first, and a key that did not exist before is *removed* on revert rather than
+blanked. Pass `--settings .conductor/settings.toml` to target a project's
+committed defaults instead of your personal ones.
+
 ## Tests
 
 ```bash
-uv run --group dev pytest        # 49 tests, no network, ~0.1s
+uv run --group dev pytest        # 64 tests, no network, ~0.15s
 ```
 
 The suite stubs out the readiness probe globally, so nothing reaches the network

@@ -15,6 +15,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from . import conductor as conductor_mod
 from . import models as model_mod, opencode, planner, provision, recipes as recipe_mod, state
 from .config import (
     DEFAULT_DISK_GB,
@@ -27,7 +28,10 @@ from .config import (
 )
 from .health import completion_smoke
 from .state import Deployment
-from .track import PHASE_STYLE, Phase, link_opencode, snapshot, unlink_opencode
+from .track import (
+    PHASE_STYLE, Phase, link_conductor, link_opencode, snapshot,
+    unlink_conductor, unlink_opencode,
+)
 from .recipes import BUILTIN_DIRNAME as BUILTIN_DIR
 from .vast import VastClient, VastError, normalize_gpu_name, ssh_target
 
@@ -294,6 +298,7 @@ def launch(
     yes: bool = typer.Option(False, "--yes", "-y"),
     watch_after: bool = typer.Option(True, "--watch/--no-watch"),
     set_default: bool = typer.Option(False, "--set-default"),
+    conductor: bool = typer.Option(False, "--conductor", help="also set Conductor's default model once serving"),
 ) -> None:
     """Launch any catalogue model on the cheapest hardware that fits it."""
     try:
@@ -344,7 +349,7 @@ def launch(
     state.save(dep)
     console.print(f"[green]rented[/] instance [bold]{dep.instance_id}[/] at {_money(dep.dph_at_launch)}/hr")
     if watch_after:
-        _watch_loop(dep, interval=10.0, set_default=set_default, reap=True)
+        _watch_loop(dep, interval=10.0, set_default=set_default, reap=True, conductor=conductor)
     else:
         console.print(f"[dim]track it with:[/] gpuctl watch {dep.instance_id}")
 
@@ -464,6 +469,7 @@ def up(
     yes: bool = typer.Option(False, "--yes", "-y", help="skip the spend confirmation"),
     watch_after: bool = typer.Option(True, "--watch/--no-watch", help="track until it is serving"),
     set_default: bool = typer.Option(False, "--set-default", help="make this opencode's default model"),
+    conductor: bool = typer.Option(False, "--conductor", help="also set Conductor's default model once serving"),
 ) -> None:
     """Rent a GPU box and start vLLM on it."""
     try:
@@ -533,7 +539,7 @@ def up(
         console.print(f"[dim]auto-destroy deadline: {time.strftime('%H:%M:%S', time.localtime(dep.deadline))}[/]")
 
     if watch_after:
-        _watch_loop(dep, interval=10.0, set_default=set_default, reap=True)
+        _watch_loop(dep, interval=10.0, set_default=set_default, reap=True, conductor=conductor)
     else:
         console.print(f"[dim]track it with:[/] gpuctl watch {dep.instance_id}")
 
@@ -589,7 +595,8 @@ def ps(
     console.print(f"[dim]live spend so far: [/][bold]{_money(total)}[/]")
 
 
-def _watch_loop(dep: Deployment, *, interval: float, set_default: bool, reap: bool) -> None:
+def _watch_loop(dep: Deployment, *, interval: float, set_default: bool, reap: bool,
+                conductor: bool = False) -> None:
     """Poll until the box is serving, then wire it into opencode."""
     config_path = opencode.target_path()
     linked = False
@@ -621,6 +628,8 @@ def _watch_loop(dep: Deployment, *, interval: float, set_default: bool, reap: bo
                     console.print(f"[dim]backup: {result.backup}[/]")
                 if set_default:
                     console.print("[dim]set as opencode's default model.[/]")
+                if conductor:
+                    _apply_conductor(state.find(dep.instance_id) or fresh)
                 break
 
             if snap.phase in (Phase.ERROR, Phase.STOPPED, Phase.GONE):
@@ -655,9 +664,111 @@ def watch(
     interval: float = typer.Option(10.0, "--interval", "-i", help="poll seconds"),
     set_default: bool = typer.Option(False, "--set-default"),
     reap: bool = typer.Option(True, "--reap/--no-reap", help="auto-destroy at the TTL deadline"),
+    conductor: bool = typer.Option(False, "--conductor", help="also set Conductor's default model once serving"),
 ) -> None:
     """Track a deployment until it serves, then configure opencode."""
-    _watch_loop(_need(ref), interval=interval, set_default=set_default, reap=reap)
+    _watch_loop(_need(ref), interval=interval, set_default=set_default, reap=reap,
+                conductor=conductor)
+
+
+# ------------------------------------------------------------- conductor
+
+conductor_app = typer.Typer(
+    no_args_is_help=False,
+    help="Point Conductor's default model at a gpuctl deployment.",
+)
+app.add_typer(conductor_app, name="conductor")
+
+
+@conductor_app.callback(invoke_without_command=True)
+def conductor_default(
+    ctx: typer.Context,
+    settings: Optional[str] = typer.Option(
+        None, "--settings",
+        help="settings.toml to read (default: ~/.conductor/settings.toml; "
+             "pass .conductor/settings.toml for a project's committed defaults)",
+    ),
+) -> None:
+    """Show Conductor's current model settings."""
+    if ctx.invoked_subcommand is not None:
+        return
+    try:
+        view = conductor_mod.read(Path(settings).expanduser() if settings else None)
+    except conductor_mod.ConductorError as exc:
+        _fail(str(exc))
+    if not view.exists:
+        console.print(f"[yellow]no Conductor settings at[/] {view.path}")
+        console.print("[dim]`gpuctl conductor set --create` will write a new file.[/]")
+        return
+
+    table = Table(box=None, pad_edge=False)
+    table.add_column(style="dim")
+    table.add_column()
+    table.add_row("settings", str(view.path))
+    for key in conductor_mod.MANAGED_KEYS:
+        table.add_row(f"models.{key}", view.get(key) or "[dim]unset[/]")
+    if view.opencode_executable:
+        table.add_row("opencode path", view.opencode_executable)
+
+    # Say whether the configured model is actually reachable right now.
+    live = {d.provider_id: d for d in state.load_all() if d.linked_at}
+    current = view.get("default") or ""
+    provider = current.split("/")[0]
+    if provider in live:
+        table.add_row("status", f"[green]points at live deployment {live[provider].instance_id}[/]")
+    elif provider.startswith("vast-"):
+        table.add_row("status", "[bold red]points at a gpuctl provider that is no longer live[/]")
+    console.print(Panel(table, title="conductor", border_style="cyan"))
+    if provider.startswith("vast-") and provider not in live:
+        console.print("[dim]`gpuctl conductor revert` restores the previous model.[/]")
+
+
+@conductor_app.command("set")
+def conductor_set(
+    ref: Optional[str] = typer.Argument(None, help="instance id or recipe key"),
+    review: bool = typer.Option(False, "--review", help="also set the code-review model"),
+    create: bool = typer.Option(False, "--create", help="write a settings file if none exists"),
+    settings: Optional[str] = typer.Option(
+        None, "--settings",
+        help="settings.toml to edit (default: ~/.conductor/settings.toml)",
+    ),
+) -> None:
+    """Set Conductor's default model to a linked deployment."""
+    dep = _need(ref)
+    target = Path(settings).expanduser() if settings else conductor_mod.SETTINGS_PATH
+    try:
+        if create:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        edit = link_conductor(dep, also_review=review, path=target)
+    except (conductor_mod.ConductorError, RuntimeError) as exc:
+        _fail(str(exc))
+    for key, value in edit.changed.items():
+        was = edit.previous.get(key)
+        console.print(f"[green]set[/] models.{key} = [bold]{value}[/]"
+                      f"[dim]{f'  (was {was})' if was else '  (was unset)'}[/]")
+    console.print(f"[dim]{edit.path}[/]")
+    if edit.backup:
+        console.print(f"[dim]backup: {edit.backup}[/]")
+
+
+@conductor_app.command("revert")
+def conductor_revert(ref: Optional[str] = typer.Argument(None)) -> None:
+    """Restore the Conductor model settings gpuctl changed."""
+    dep = state.resolve(ref) if ref else None
+    if dep is None:
+        candidates = [d for d in state.load_all(include_destroyed=True) if d.conductor_prev]
+        if not candidates:
+            console.print("[dim]gpuctl has not changed Conductor's settings.[/]")
+            return
+        dep = candidates[-1]
+    try:
+        restored = unlink_conductor(dep)
+    except conductor_mod.ConductorError as exc:
+        _fail(str(exc))
+    if restored:
+        console.print(f"[green]reverted[/] models.{', models.'.join(sorted(set(restored)))}")
+    else:
+        console.print("[dim]nothing to revert.[/]")
 
 
 # -------------------------------------------------------------- link / logs
@@ -669,6 +780,7 @@ def link(
     set_default: bool = typer.Option(False, "--set-default"),
     config: Optional[str] = typer.Option(None, "--config", help="opencode config to edit"),
     project: bool = typer.Option(False, "--project", help="write ./opencode.json instead of the global config"),
+    conductor: bool = typer.Option(False, "--conductor", help="also set Conductor's default model"),
 ) -> None:
     """Write a serving deployment into opencode's config now."""
     dep = _need(ref)
@@ -682,6 +794,8 @@ def link(
     console.print(f"[green]linked[/] {result.provider_id} → {result.path}")
     if result.backup:
         console.print(f"[dim]backup: {result.backup}[/]")
+    if conductor:
+        _apply_conductor(state.find(dep.instance_id) or dep)
 
 
 @app.command()
@@ -735,12 +849,29 @@ def ssh(
 # ------------------------------------------------------------ down / reap
 
 
+def _apply_conductor(dep: Deployment) -> None:
+    """Best-effort: a Conductor edit must never fail a launch."""
+    try:
+        edit = link_conductor(dep)
+    except (conductor_mod.ConductorError, RuntimeError) as exc:
+        err.print(f"[yellow]Conductor not updated:[/] {exc}")
+        return
+    console.print(f"[green]Conductor default model[/] → [bold]{edit.changed['default']}[/]"
+                  f"[dim]  (was {edit.previous.get('default') or 'unset'})[/]")
+
+
 def _destroy(client: VastClient, dep: Deployment) -> None:
     try:
         client.destroy_instance(dep.instance_id)
     except VastError as exc:
         err.print(f"[yellow]destroy call failed:[/] {exc}")
     unlink_opencode(dep)
+    # Never leave Conductor pointing at a destroyed instance.
+    try:
+        if unlink_conductor(dep):
+            console.print("[dim]reverted Conductor's model setting.[/]")
+    except conductor_mod.ConductorError as exc:
+        err.print(f"[yellow]could not revert Conductor:[/] {exc}")
     dep.destroyed_at = time.time()
     state.save(dep)
 

@@ -33,6 +33,9 @@ class Deployment:
     label: str = ""
     opencode_provider: str = ""
     opencode_target: str = ""
+    conductor_target: str = ""
+    # [models] keys we overwrote, and their prior values (None = key was absent).
+    conductor_prev: dict[str, Any] = field(default_factory=dict)
     endpoint: str = ""
     linked_at: float | None = None
     destroyed_at: float | None = None

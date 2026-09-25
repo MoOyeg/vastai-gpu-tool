@@ -154,6 +154,55 @@ def link_opencode(
     return result
 
 
+def link_conductor(
+    dep: Deployment,
+    *,
+    path=None,
+    also_review: bool = False,
+):
+    """Point Conductor's default model at this deployment.
+
+    Conductor discovers OpenCode models from opencode's own provider config, so
+    this only makes sense once the deployment is linked there.
+    """
+    from . import conductor
+
+    if not (dep.linked_at and dep.opencode_provider):
+        raise RuntimeError(
+            f"instance {dep.instance_id} is not linked into opencode yet; "
+            f"run `gpuctl link {dep.instance_id}` first."
+        )
+    model_id = dep.notes.get("linked_model_id") or dep.served_name
+    ref = conductor.model_ref(dep.opencode_provider, model_id)
+    updates = {"default": ref}
+    if also_review:
+        updates["review"] = ref
+
+    edit = conductor.set_models(updates, path=path)
+    dep.conductor_target = str(edit.path)
+    # Keep the first-seen previous values: re-pointing twice must not record
+    # our own value as the thing to restore.
+    for key, was in edit.previous.items():
+        dep.conductor_prev.setdefault(key, was)
+    save(dep)
+    return edit
+
+
+def unlink_conductor(dep: Deployment) -> list[str]:
+    """Restore whatever Conductor's [models] keys were before we changed them."""
+    from pathlib import Path as _Path
+
+    from . import conductor
+
+    if not dep.conductor_target or not dep.conductor_prev:
+        return []
+    restored = conductor.revert(dict(dep.conductor_prev), path=_Path(dep.conductor_target))
+    dep.conductor_target = ""
+    dep.conductor_prev = {}
+    save(dep)
+    return restored
+
+
 def _context_from_args(dep: Deployment) -> int | None:
     from .recipes import all_recipes
 
