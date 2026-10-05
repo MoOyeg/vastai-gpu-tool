@@ -48,6 +48,11 @@ class Model:
     # Names are from `vllm serve --help=all` on vLLM 0.29.
     tool_parser: str = "hermes"
     min_compute_cap: int | None = None   # sm x100 (860 = sm_86); None = infer from quant
+    # Multi-token-prediction heads shipped inside this checkpoint, so
+    # speculative decoding needs no separate draft model. Set only where
+    # config.json actually declares num_nextn_predict_layers > 0.
+    mtp_method: str | None = None
+    mtp_tokens: int | None = None
     notes: str = ""
     vllm_args: list[str] = field(default_factory=list)
 

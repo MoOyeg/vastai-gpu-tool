@@ -28,6 +28,53 @@ things:
   wedges while nobody is watching — it bills at full rate and looks exactly
   like one that is merely slow. See below.
 
+## Speculative decoding
+
+Draft several tokens cheaply, have the target model verify them in one forward
+pass. Because decode is memory-bandwidth-bound ([METHOD §1](docs/METHOD.md)),
+verifying K drafts costs about what generating one token costs — so this can
+lift tok/s past the ceiling a one-token-at-a-time weight read implies. It only
+helps to the extent drafts are *accepted*, which is why `bench` reports the
+acceptance rate next to the throughput.
+
+Per recipe:
+
+```toml
+[speculative]
+method = "ngram"               # needs no draft model at all
+num_speculative_tokens = 5
+prompt_lookup_max = 4
+```
+
+Or ad hoc, on `up` and `launch`:
+
+```bash
+gpuctl up build-a --spec ngram --spec-tokens 4
+gpuctl up build-a --spec draft_model --spec-model Qwen/Qwen2.5-0.5B-Instruct
+gpuctl launch llama70b --spec auto     # the model's own MTP head, else ngram
+gpuctl up minimax-m3 --no-spec         # turn a recipe's setting off
+```
+
+`--spec auto` uses a multi-token-prediction head when the checkpoint ships one
+and falls back to `ngram`, which never needs a draft model.
+
+Methods, required fields and defaults come from `vllm/config/speculative.py` at
+v0.30.0 — the flag is a single JSON blob (`--speculative-config`), and a typo in
+it is otherwise silently ignored by vLLM, so recipes are validated on load:
+unknown methods, a missing `num_speculative_tokens`, a draft-model method with no
+`model`, or an MTP method *with* one all fail with the filename.
+
+**MTP is only claimed where the checkpoint declares it.** `minimax-m3` and
+`deepseek-v4.1-flash-max` ship next-token heads (`num_nextn_predict_layers` of 1
+and 3 respectively) and have `[speculative]` set accordingly. Qwen3.8, Kimi K3
+and MiMo declare none, despite vLLM having method names that look applicable, so
+they get nothing — use `ngram` or a draft model there.
+
+`bench` reports acceptance by diffing vLLM's `vllm:spec_decode_num_*` counters
+either side of the run, since they are cumulative and would otherwise fold in
+every earlier request. Below ~30% acceptance it says so, because speculation can
+cost more than it saves.
+
 ## Accounting
 
 `gpuctl ledger` keeps a running account of every box rented — whether it ever

@@ -23,3 +23,9 @@ vllm_args = [
   "--reasoning-parser", "deepseek_v41",
   "--default-chat-template-kwargs", "'{\"thinking\":true,\"reasoning_effort\":100}'",
 ]
+
+# DeepSeek V4.1 Flash declares num_nextn_predict_layers = 3, so up to three
+# tokens can be drafted by heads already in the checkpoint.
+[speculative]
+method = "deepseek_mtp"
+num_speculative_tokens = 3

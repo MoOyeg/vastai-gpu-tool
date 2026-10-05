@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import CONFIG_DIR
+from .speculative import Speculative, SpeculativeError
+from .speculative import from_mapping as _spec_from_mapping
 
 BUILTIN_DIRNAME = "recipes.d"
 USER_RECIPES_DIR = CONFIG_DIR / "recipes"
@@ -62,12 +64,18 @@ class Recipe:
     image: str = "vllm/vllm-openai:latest"
     # Extra container env vars, e.g. VLLM_FLOAT32_MATMUL_PRECISION=high.
     extra_env: dict[str, Any] = field(default_factory=dict)
+    # Speculative decoding, from a [speculative] table in the recipe file.
+    speculative: Speculative | None = None
     source: str = ""        # where this recipe was loaded from, for provenance
 
     @property
     def tool_args(self) -> list[str]:
         return (["--enable-auto-tool-choice", "--tool-call-parser", self.tool_parser]
                 if self.tool_parser else [])
+
+    @property
+    def spec_args(self) -> list[str]:
+        return self.speculative.cli_args() if self.speculative else []
 
     @property
     def served_name(self) -> str:
@@ -183,6 +191,14 @@ def _from_mapping(key: str, data: dict[str, Any], source: str) -> Recipe:
             f"Valid: {sorted(_FIELDS - {'key', 'source'}) + sorted(_SUGAR)}"
         )
 
+    spec_table = data.pop("speculative", None)
+    speculative = None
+    if spec_table is not None:
+        try:
+            speculative = _spec_from_mapping(spec_table, f"{source}: [speculative]")
+        except SpeculativeError as exc:
+            raise RecipeError(str(exc)) from None
+
     model_key = data.pop("model_key", None)
     if model_key:
         from .models import MODELS
@@ -196,7 +212,8 @@ def _from_mapping(key: str, data: dict[str, Any], source: str) -> Recipe:
         data.setdefault("model", m.hf_id)
         data.setdefault("tool_parser", m.tool_parser)
 
-    data = {k: _coerce(k, v, source) for k, v in data.items()}
+    data = {k: (v if k == "speculative" else _coerce(k, v, source))
+            for k, v in data.items()}
 
     if "num_gpus" in data and data["num_gpus"] < 1:
         raise RecipeError(f"{source}: num_gpus must be at least 1")
@@ -217,6 +234,8 @@ def _from_mapping(key: str, data: dict[str, Any], source: str) -> Recipe:
         # agent client will fail against this recipe, so make it visible.
         data["tool_parser"] = ""
 
+    if speculative is not None:
+        data["speculative"] = speculative
     try:
         return Recipe(key=key, source=source, **data)
     except TypeError as exc:

@@ -80,6 +80,7 @@ def build_onstart(recipe: Recipe, *, port: int, extra_args: list[str] | None = N
         "--api-key", '"$VLLM_API_KEY"',
         *recipe.vllm_args,
         *recipe.tool_args,
+        *recipe.spec_args,
         *(extra_args or []),
     ]
     script = "\n".join(

@@ -17,6 +17,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import conductor as conductor_mod
+from . import speculative as spec_mod
 from . import ledger as ledger_mod
 from . import models as model_mod, opencode, planner, provision, recipes as recipe_mod, state
 from .config import (
@@ -153,6 +154,63 @@ def gpus(filter: str = typer.Option("", "--filter", "-f", help="substring match"
         return
     for n in names:
         console.print(f"  {n}  [dim]({normalize_gpu_name(n)})[/]")
+
+
+# ------------------------------------------------------- speculative decoding
+
+
+def _resolve_spec(
+    *,
+    current: "spec_mod.Speculative | None",
+    method: Optional[str],
+    draft_model: Optional[str],
+    tokens: Optional[int],
+    disable: bool,
+    mtp_method: str | None = None,
+    mtp_tokens: int | None = None,
+) -> "spec_mod.Speculative | None":
+    """Work out the speculative config from a recipe plus any CLI overrides.
+
+    `--spec auto` picks the model's own multi-token-prediction head when the
+    checkpoint ships one, and otherwise falls back to `ngram`, which needs no
+    draft model at all.
+    """
+    if disable:
+        return None
+    if method is None and tokens is None and draft_model is None:
+        return current
+
+    chosen = method or (current.method if current else None)
+    if chosen == "auto":
+        chosen = mtp_method or "ngram"
+    if chosen is None:
+        chosen = "ngram"
+
+    n = tokens
+    if n is None:
+        if current and (method is None or method == current.method):
+            n = current.num_speculative_tokens
+        elif chosen == mtp_method and mtp_tokens:
+            n = mtp_tokens
+        else:
+            # vLLM's own ngram default window is 5; four drafts is a common
+            # starting point and cheap to tune with `gpuctl bench`.
+            n = 4
+
+    body: dict[str, Any] = {"method": chosen, "num_speculative_tokens": n}
+    if current and chosen == current.method:
+        body.update(current.options)
+    model = draft_model or (current.model if current and chosen == current.method else None)
+    if model:
+        body["model"] = model
+    try:
+        return spec_mod.from_mapping(body, "speculative (from flags)")
+    except spec_mod.SpeculativeError as exc:
+        _fail(str(exc))
+
+
+_SPEC_HELP = ("speculative decoding method, or 'auto' for the model's own MTP head "
+              f"(falls back to ngram). Known: {', '.join(sorted(spec_mod.METHODS))[:120]}…")
 
 
 # --------------------------------------------------------------------- recipes
@@ -304,6 +362,9 @@ def launch(
     set_default: bool = typer.Option(False, "--set-default"),
     conductor: bool = typer.Option(False, "--conductor", help="also set Conductor's default model once serving"),
     on_stall: str = typer.Option("warn", "--on-stall", help="what to do if it hangs: warn | destroy"),
+    spec: Optional[str] = typer.Option(None, "--spec", help=_SPEC_HELP),
+    spec_model: Optional[str] = typer.Option(None, "--spec-model", help="draft checkpoint for --spec"),
+    spec_tokens: Optional[int] = typer.Option(None, "--spec-tokens", help="tokens to draft per step"),
 ) -> None:
     """Launch any catalogue model on the cheapest hardware that fits it."""
     try:
@@ -337,6 +398,9 @@ def launch(
             chosen = fits[0]
 
         r = _recipe_for(m, chosen, context=context, fp8_kv=fp8_kv)
+        r = dataclasses.replace(r, speculative=_resolve_spec(
+            current=None, method=spec, draft_model=spec_model, tokens=spec_tokens,
+            disable=False, mtp_method=m.mtp_method, mtp_tokens=m.mtp_tokens))
         s = provision.offer_summary(chosen.offer)
         plan_t = Table(box=None, pad_edge=False)
         plan_t.add_column(style="dim"); plan_t.add_column()
@@ -347,6 +411,8 @@ def launch(
         plan_t.add_row("context", f"{context:,}{' (fp8 KV)' if fp8_kv else ''}  [dim]max {chosen.max_context:,}[/]")
         plan_t.add_row("est decode", f"{chosen.est_tokps:.0f} tok/s  [dim](modelled, ±25%)[/]" if chosen.est_tokps else "?")
         plan_t.add_row("disk / net", f"{r.disk_gb} GB  /  ↓{s['inet_down']:.0f} Mbps")
+        if r.speculative:
+            plan_t.add_row("speculative", r.speculative.describe())
         plan_t.add_row("price", f"[bold]{_money(chosen.dph)}/hr[/]")
         plan_t.add_row("auto-destroy", f"after {ttl:g}h  →  ~{_money(chosen.dph * ttl)} max" if ttl > 0
                        else "[bold red]NONE — bills until destroyed[/]")
@@ -578,6 +644,10 @@ def up(
     set_default: bool = typer.Option(False, "--set-default", help="make this opencode's default model"),
     conductor: bool = typer.Option(False, "--conductor", help="also set Conductor's default model once serving"),
     on_stall: str = typer.Option("warn", "--on-stall", help="what to do if it hangs: warn | destroy"),
+    spec: Optional[str] = typer.Option(None, "--spec", help=_SPEC_HELP),
+    spec_model: Optional[str] = typer.Option(None, "--spec-model", help="draft checkpoint for --spec"),
+    spec_tokens: Optional[int] = typer.Option(None, "--spec-tokens", help="tokens to draft per step"),
+    no_spec: bool = typer.Option(False, "--no-spec", help="disable the recipe's speculative decoding"),
 ) -> None:
     """Rent a GPU box and start vLLM on it."""
     try:
@@ -586,6 +656,9 @@ def up(
         _fail(str(exc))
     if model:
         r = dataclasses.replace(r, model=model)
+    r = dataclasses.replace(r, speculative=_resolve_spec(
+        current=r.speculative, method=spec, draft_model=spec_model,
+        tokens=spec_tokens, disable=no_spec))
 
     ceiling = max_dph if max_dph is not None else min(r.max_dph, DEFAULT_MAX_DPH)
     disk_gb = disk or r.disk_gb or DEFAULT_DISK_GB
@@ -628,6 +701,9 @@ def up(
         if r.extra_env:
             plan.add_row("env", " ".join(f"{k}={v}" for k, v in r.extra_env.items()))
         plan.add_row("disk", f"{disk_gb} GB")
+        if r.speculative:
+            plan.add_row("speculative", r.speculative.describe()
+                         + "  [dim](bench reports the acceptance rate)[/]")
         plan.add_row("price", f"[bold]{_money(s['dph'])}/hr[/]")
         plan.add_row(
             "auto-destroy",
@@ -1269,6 +1345,37 @@ def reap(
 
 # ------------------------------------------------------------------- bench
 
+
+def _spec_counters(endpoint: str, serve_key: str) -> "spec_mod.Acceptance | None":
+    """Read vLLM's speculative counters, or None if the server is not drafting."""
+    import httpx
+
+    try:
+        r = httpx.get(endpoint.rstrip("/") + "/metrics", timeout=10,
+                      headers={"Authorization": f"Bearer {serve_key}"})
+    except httpx.HTTPError:
+        return None
+    if r.status_code != 200:
+        return None
+    return spec_mod.parse_metrics(r.text)
+
+
+def _spec_delta(
+    before: "spec_mod.Acceptance | None", after: "spec_mod.Acceptance | None"
+) -> "spec_mod.Acceptance | None":
+    if after is None:
+        return None
+    if before is None:
+        return after
+    delta = spec_mod.Acceptance(
+        accepted=after.accepted - before.accepted,
+        drafted=after.drafted - before.drafted,
+        drafts=after.drafts - before.drafts,
+    )
+    # Nothing drafted during the run: fall back to the lifetime figures rather
+    # than reporting a meaningless zero.
+    return delta if delta.drafted > 0 else after
+
 # A reasoning model streams its thinking in `delta.reasoning` (or
 # `reasoning_content`, depending on the vLLM parser) and may emit no `content` at
 # all inside the token budget. Those are still generated tokens costing the same
@@ -1312,6 +1419,11 @@ def bench(
     ok, msg = completion_smoke(snap.endpoint, dep.serve_key, model_id)
     if not ok:
         _fail(f"smoke test failed: {msg}")
+
+    # Speculative counters are cumulative over the server's life, so snapshot
+    # them either side of the run and diff — otherwise the smoke test and every
+    # earlier request are mixed into the acceptance rate.
+    before = _spec_counters(snap.endpoint, dep.serve_key)
 
     url = snap.endpoint.rstrip("/") + "/v1/chat/completions"
     body = {
@@ -1384,6 +1496,9 @@ def bench(
     table.add_row("hardware", f"{dep.gpu_label}  ({_money(dep.dph_at_launch)}/hr)")
     table.add_row("model", model_id)
     table.add_row("TTFT", f"{ttft * 1000:.0f} ms")
+    after = _spec_counters(snap.endpoint, dep.serve_key)
+    acceptance = _spec_delta(before, after)
+
     source = "server-reported" if reported else "chunk count"
     table.add_row("decode", f"[bold]{tokps:.1f} tok/s[/]  ({counted} tokens, {source}, in {decode_s:.1f}s)")
     thinking = reported_reasoning if reported_reasoning is not None else reasoning_chunks
@@ -1391,6 +1506,15 @@ def bench(
         table.add_row("of which reasoning", f"{thinking} tokens "
                       f"({thinking / counted:.0%} of the budget spent thinking)")
     table.add_row("ITL / TPOT", f"{1000 / tokps:.0f} ms" if tokps else "—")
+    if acceptance:
+        rate = acceptance.rate
+        per = acceptance.tokens_per_draft
+        table.add_row("speculative", (
+            f"{rate:.0%} of drafts accepted" if rate is not None else "no drafts")
+            + (f", {per:.2f} tokens per draft round" if per else ""))
+        if rate is not None and rate < 0.3:
+            table.add_row("", "[yellow]low acceptance — speculation may be costing "
+                              "more than it saves here[/]")
     table.add_row("doc estimate", f"{est}   [dim]({dep.notes.get('doc_ref', '')})[/]")
     table.add_row("cost of this run", _money(dep.dph_at_launch * (finished - started) / 3600))
     console.print(Panel(table, title="measured", border_style="green"))

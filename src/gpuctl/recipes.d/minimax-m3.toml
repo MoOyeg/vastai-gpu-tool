@@ -19,3 +19,9 @@ vllm_args = [
   "--gpu-memory-utilization", "0.92",
   "--reasoning-parser", "minimax_m3",
 ]
+
+# MiniMax-M3's config.json declares num_nextn_predict_layers = 1, so the
+# multi-token-prediction head ships with the checkpoint — no draft model needed.
+[speculative]
+method = "minimax_m3_mtp"
+num_speculative_tokens = 1
