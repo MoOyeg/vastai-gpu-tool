@@ -75,6 +75,27 @@ SUSPICIOUS_STATUS_PATTERNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _stuck_pull(snap: "Snapshot") -> tuple[str, str] | None:
+    """A LOADING instance that has not written a single byte to disk.
+
+    Vast reports disk_usage -1 before anything lands. A healthy image pull moves
+    that within a minute or two; a host that cannot reach the registry sits at
+    -1 with its status_msg frozen on one layer. Observed on a host that also
+    could not reach Docker Hub, which otherwise would have burned the full
+    30-minute LOADING budget.
+    """
+    if snap.phase is not Phase.LOADING:
+        return None
+    try:
+        disk = float((snap.instance or {}).get("disk_usage"))
+    except (TypeError, ValueError):
+        return None
+    if disk > 0:
+        return None
+    return ("disk_usage<=0", "nothing written to disk yet — the host may not "
+                             "be able to reach the image registry")
+
+
 def suspicious_status(status_msg: str | None) -> tuple[str, str] | None:
     """Recognise provisioning trouble. Returns (phrase, why) or None.
 
@@ -178,6 +199,8 @@ def snapshot(
     # Provisioning trouble does not condemn a box -- Vast retries and hosts do
     # recover -- but it does mean we should stop waiting sooner.
     trouble = suspicious_status(snap.instance.get("status_msg"))
+    if trouble is None:
+        trouble = _stuck_pull(snap)
     if trouble:
         limit = min(limit, SUSPICIOUS_STALL_AFTER)
 

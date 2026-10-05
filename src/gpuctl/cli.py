@@ -633,6 +633,7 @@ def up(
     offer: Optional[int] = typer.Option(None, "--offer", help="specific offer id; default = cheapest"),
     choose: bool = typer.Option(False, "--choose", help="pick from the cheapest few instead of taking #1"),
     choices: int = typer.Option(5, "--choices", help="how many offers --choose lists (1-10)"),
+    exclude_geo: str = typer.Option("", "--exclude-geo", help="comma-separated substrings to avoid, e.g. ', CN'"),
     max_dph: Optional[float] = typer.Option(None, "--max-dph", help="hard price ceiling, $/hr"),
     ttl: float = typer.Option(DEFAULT_TTL_HOURS, "--ttl", help="auto-destroy deadline in hours (0 = none)"),
     disk: Optional[int] = typer.Option(None, "--disk", help="disk GB (default: per recipe)"),
@@ -668,8 +669,12 @@ def up(
             offers = provision.search(c, r, max_dph=ceiling, limit=25)
         except VastError as exc:
             _fail(str(exc))
+        for bad in [g.strip() for g in exclude_geo.split(",") if g.strip()]:
+            offers = [o for o in offers
+                      if bad.lower() not in str(o.get("geolocation", "")).lower()]
         if not offers:
-            _fail(f"no offers for {r.num_gpus}x {r.gpu_name} under ${ceiling:.2f}/hr.")
+            _fail(f"no offers for {r.num_gpus}x {r.gpu_name} under ${ceiling:.2f}/hr"
+                  + (f" outside {exclude_geo!r}" if exclude_geo else "") + ".")
 
         chosen = None
         if offer is not None:

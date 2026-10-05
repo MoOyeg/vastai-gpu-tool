@@ -4,7 +4,10 @@ title = "Smoke test — 1x cheap 24 GB, 7B AWQ"
 gpu_name = "RTX 3090"
 num_gpus = 1
 model_key = "qwen7b"
-disk_gb = 40
+# 40 GB was too tight and stalled the image pull on two hosts: the vLLM image
+# is ~9 GB compressed and ~20 GB extracted, and docker needs both at once,
+# plus 5.6 GB of weights — about 35 GB peak with nothing spare.
+disk_gb = 80
 max_dph = 0.3
 min_inet_down = 200
 min_cuda = 13.0

@@ -150,6 +150,37 @@ consequences: a throughput measurement must count `delta.reasoning`, not just
 endpoint); and an agent using it needs a generous `max_tokens`, or a lower
 `reasoning_effort`, or it will burn the whole budget before replying.
 
+### Speculative decoding: measured, and it cuts both ways
+
+Qwen2.5-7B-AWQ, 1× RTX 3090, `ngram` drafting 4 tokens. Same box, same server —
+the only variable is the prompt, and therefore the acceptance rate.
+
+| workload | acceptance | accepted/round | decode | vs baseline |
+|---|---|---|---|---|
+| echo-heavy (repeat a function verbatim) | 76% | 3.02 | **268 tok/s** | **1.85× faster** |
+| *no speculation at all* | — | — | *145 tok/s* | *baseline* |
+| open-ended (write an essay) | 12–19% | 0.50–0.75 | **79 tok/s** | **1.84× slower** |
+
+A 3.4× swing between best and worst case, from one setting. Every figure is the
+mean of repeat runs that agreed within 4 tok/s.
+
+**Why.** `ngram` drafts by matching repeated n-grams from the context. When the
+output echoes the input — quoting code, filling a template, RAG-style extraction —
+it guesses almost everything right and three accepted tokens arrive for the price
+of roughly one forward pass. On open-ended generation there is nothing to match,
+so it drafts 4, keeps well under 1, and pays for the rejected remainder every
+round.
+
+**So speculative decoding is not a free speed-up, and `ngram` in particular is a
+workload-specific bet.** The acceptance rate is the whole story, which is why
+`gpuctl bench` reports it and warns below 30%. Measure on prompts resembling your
+real traffic before enabling it; a draft model or an MTP head generalises better
+than `ngram` but needs weights, and neither is free either.
+
+This also settles an open question from the original hardware analysis, which
+hoped speculative decoding "may make build A sufficient outright": not with
+`ngram` on open-ended work — it makes it materially worse.
+
 ## 8. The rent-test matrix
 
 The preset recipes in `recipes.py` exist to answer, with measurements rather than

@@ -72,8 +72,19 @@ they get nothing — use `ngram` or a draft model there.
 
 `bench` reports acceptance by diffing vLLM's `vllm:spec_decode_num_*` counters
 either side of the run, since they are cumulative and would otherwise fold in
-every earlier request. Below ~30% acceptance it says so, because speculation can
-cost more than it saves.
+every earlier request. Below ~30% acceptance it says so — and that warning is not
+theoretical. Measured on one box, `ngram ×4` against no speculation at all:
+
+| workload | acceptance | decode | vs baseline |
+|---|---|---|---|
+| echo-heavy (repeat a function) | 76% | 268 tok/s | **1.85× faster** |
+| *none* | — | *145 tok/s* | *baseline* |
+| open-ended (write an essay) | 12–19% | 79 tok/s | **1.84× slower** |
+
+Same hardware, same server, same flag — only the prompt differs. `ngram` drafts
+by matching repeated n-grams from the context, so it wins when the output echoes
+the input (code, templates, RAG) and loses badly when there is nothing to match.
+Measure before enabling it. Full numbers in [METHOD §7](docs/METHOD.md).
 
 ## Accounting
 
