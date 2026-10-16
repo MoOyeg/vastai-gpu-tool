@@ -337,14 +337,19 @@ def link_opencode(
         raise RuntimeError("cannot link: no public endpoint yet")
 
     model_id = (snap.probe.best_model if snap.probe else None) or dep.served_name
-    ctx = context_len or _context_from_args(dep) or 32768
+    if context_len:
+        choice = ContextChoice(context_len, min(max(context_len // 4, 4096), 32768),
+                               "given on the command line")
+    else:
+        choice = resolve_context(dep, snap)
 
     block = opencode.provider_block(
         display_name=f"Vast {dep.gpu_label or dep.recipe} ({dep.instance_id})",
         endpoint=snap.endpoint,
         serve_key=dep.serve_key,
         model_id=model_id,
-        context_len=ctx,
+        context_len=choice.tokens,
+        max_output=choice.output,
     )
     result = opencode.link(
         path=config_path,
@@ -359,6 +364,9 @@ def link_opencode(
     dep.endpoint = snap.endpoint
     dep.linked_at = time.time()
     dep.notes["linked_model_id"] = model_id
+    dep.notes["context_len"] = choice.tokens
+    dep.notes["max_output"] = choice.output
+    dep.notes["context_source"] = choice.source
     if result.previous_default and set_default:
         dep.notes["previous_default_model"] = result.previous_default
     save(dep)
@@ -439,6 +447,124 @@ def unlink_conductor(dep: Deployment) -> list[str]:
     dep.conductor_prev = {}
     save(dep)
     return restored
+
+
+@dataclass
+class ContextChoice:
+    tokens: int
+    output: int
+    source: str
+
+
+def _recipe_context(dep: Deployment) -> int | None:
+    """The `--max-model-len` the recipe asked for, if it is a plain number.
+
+    Recipes may legitimately pass `auto` (mimo-v2.6-pro does), which is not a
+    number and must not silently become a default.
+    """
+    from .recipes import all_recipes
+
+    recipe = all_recipes().get(dep.recipe)
+    if not recipe or "--max-model-len" not in recipe.vllm_args:
+        return None
+    args = recipe.vllm_args
+    try:
+        return int(args[args.index("--max-model-len") + 1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _uses_fp8_kv(dep: Deployment) -> bool:
+    from .recipes import all_recipes
+
+    recipe = all_recipes().get(dep.recipe)
+    if not recipe:
+        return False
+    args = recipe.vllm_args
+    return "--kv-cache-dtype" in args and "fp8" in args[args.index("--kv-cache-dtype") + 1:
+                                                        args.index("--kv-cache-dtype") + 2]
+
+
+def _is_reasoning(dep: Deployment) -> bool:
+    from .recipes import all_recipes
+
+    recipe = all_recipes().get(dep.recipe)
+    return bool(recipe and "--reasoning-parser" in recipe.vllm_args)
+
+
+def _vram_context(dep: Deployment, instance: dict[str, Any] | None) -> int | None:
+    """Largest context this GPU could hold for this model, from first principles.
+
+    Weights plus activations come off the card first; whatever is left is KV
+    cache, and KV per token is fixed by the architecture (docs/METHOD.md §3).
+    Only usable when the model is in the catalogue, since that is where the
+    weight size and KV geometry live.
+    """
+    from .models import GIB, MODELS
+    from .planner import GPU_MEM_UTIL
+
+    model = next((m for m in MODELS.values() if m.hf_id == dep.model), None)
+    if model is None or not instance:
+        return None
+    per_gpu_mib = float(instance.get("gpu_ram") or 0)
+    gpus = int(instance.get("num_gpus") or 1)
+    vram_gib = per_gpu_mib * gpus / 1024.0
+    if vram_gib <= 0:
+        return None
+    spare = vram_gib * GPU_MEM_UTIL - model.weights_gib - (2.0 + 0.6 * (gpus - 1))
+    if spare <= 0:
+        return None
+    per_token = model.kv_bytes_per_token / (2 if _uses_fp8_kv(dep) else 1)
+    return int(spare * GIB / per_token) or None
+
+
+def _architectural_max(dep: Deployment) -> int | None:
+    from .models import MODELS
+
+    model = next((m for m in MODELS.values() if m.hf_id == dep.model), None)
+    return model.max_context if model else None
+
+
+def resolve_context(dep: Deployment, snap: "Snapshot") -> ContextChoice:
+    """Pick the context window to advertise to opencode, and say where it came from.
+
+    Order matters. The server's own figure wins because it is the only one that
+    accounts for what actually fit on the GPU after the KV cache was allocated —
+    vLLM will happily boot with less than the recipe requested. Everything below
+    it is a fallback for when the server does not say.
+    """
+    tokens: int | None = snap.probe.best_context if snap.probe else None
+    source = "reported by the server"
+
+    if tokens is None:
+        asked = _recipe_context(dep)
+        capacity = _vram_context(dep, snap.instance)
+        if asked and capacity:
+            # vLLM clamps to whichever is smaller, so advertise that.
+            tokens = min(asked, capacity)
+            source = ("the recipe's --max-model-len" if asked <= capacity
+                      else "what this GPU can hold for this model")
+        elif asked:
+            tokens, source = asked, "the recipe's --max-model-len"
+        elif capacity:
+            tokens, source = capacity, "what this GPU can hold for this model"
+
+    if tokens is None:
+        tokens, source = 32768, "a conservative default (nothing better available)"
+
+    ceiling = _architectural_max(dep)
+    if ceiling and tokens > ceiling:
+        tokens, source = ceiling, "the model's architectural maximum"
+
+    # Output budget. A reasoning model can spend its whole allowance thinking —
+    # Qwen3.8 used 100% of a 400-token budget before answering — so give those
+    # models a far larger share.
+    if _is_reasoning(dep):
+        output = min(max(tokens // 2, 8192), 65536)
+    else:
+        output = min(max(tokens // 4, 4096), 32768)
+    output = min(output, tokens)
+    return ContextChoice(tokens=tokens, output=output, source=source)
 
 
 def _context_from_args(dep: Deployment) -> int | None:

@@ -10,5 +10,8 @@ min_inet_down = 400
 min_cuda = 13.0
 est_tokps = "~11"
 doc_ref = "METHOD §3"
-notes = "Slow but ~28k ctx at fp16 KV on one card. Tests context-vs-speed directly."
-vllm_args = ["--max-model-len", "28672", "--gpu-memory-utilization", "0.92"]
+notes = "~28k ctx on one card, but only with fp8 KV — at fp16 the same card tops out near 16.6k, which is what `gpuctl link` now computes and advertises."
+# 48 GiB holds 37.1 GiB of weights, leaving ~5 GiB of KV at 0.92 utilisation —
+# only ~16.6k tokens at fp16, so the 28,672 this recipe wants would refuse to
+# start. fp8 KV halves bytes per token and lifts capacity to ~33k, which fits.
+vllm_args = ["--max-model-len", "28672", "--kv-cache-dtype", "fp8", "--gpu-memory-utilization", "0.92"]

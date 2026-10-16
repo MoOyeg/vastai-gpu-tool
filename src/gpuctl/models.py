@@ -164,6 +164,14 @@ MODELS: dict[str, Model] = {m.key: m for m in [
        notes="Unquantized version of coder-30b — only worth it if you have 96 GB.",
        vllm_args=["--max-model-len", "65536"]),
 
+    _m(key="qwen3.8-27b", hf_id="Qwen/Qwen3.8-27B-FP8", label="Qwen3.8 27B (dense, FP8)",
+       weights_gb=30.9, layers=64, kv_heads=4, head_dim=256, attn_heads=24,
+       max_context=262144, quant="fp8", family="qwen3.8", tool_parser="qwen3_xml",
+       notes="Vision-language (Qwen3VL) and a reasoning model: measured 50.7 tok/s at "
+             "TP=1 on one 96 GiB card, and it will spend a whole short output budget "
+             "thinking. 256 KiB/token of KV makes fp8 KV worthwhile.",
+       vllm_args=["--max-model-len", "131072", "--kv-cache-dtype", "fp8"]),
+
     _m(key="llama70b", tool_parser="llama3_json", hf_id="casperhansen/llama-3.3-70b-instruct-awq",
        label="Llama 3.3 70B Instruct (AWQ)",
        weights_gb=39.8, layers=80, kv_heads=8, head_dim=128, attn_heads=64,

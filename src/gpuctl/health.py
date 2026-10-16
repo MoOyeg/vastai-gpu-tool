@@ -1,7 +1,7 @@
 """Readiness probing for the remote vLLM server."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -12,10 +12,21 @@ class Probe:
     serving: bool
     model_ids: list[str]
     detail: str = ""
+    # vLLM puts the context length it actually booted with on each model card
+    # (serving.py: ModelCard(..., max_model_len=model_config.max_model_len)).
+    # This is the authoritative figure: it reflects whatever vLLM settled on
+    # after fitting the KV cache into the GPU it is actually running on, which
+    # may be well below what the recipe asked for.
+    max_model_len: dict[str, int] = field(default_factory=dict)
 
     @property
     def best_model(self) -> str | None:
         return self.model_ids[0] if self.model_ids else None
+
+    @property
+    def best_context(self) -> int | None:
+        model = self.best_model
+        return self.max_model_len.get(model) if model else None
 
 
 def probe(endpoint: str, serve_key: str, timeout: float = 6.0) -> Probe:
@@ -39,8 +50,16 @@ def probe(endpoint: str, serve_key: str, timeout: float = 6.0) -> Probe:
         payload = r.json()
     except ValueError:
         return Probe(True, False, [], "non-JSON from /v1/models")
-    ids = [m.get("id") for m in payload.get("data", []) if m.get("id")]
-    return Probe(True, bool(ids), ids, "ok" if ids else "no models listed yet")
+    cards = payload.get("data", [])
+    ids = [m.get("id") for m in cards if m.get("id")]
+    lens = {
+        m["id"]: int(m["max_model_len"])
+        for m in cards
+        if m.get("id") and isinstance(m.get("max_model_len"), (int, float))
+        and int(m["max_model_len"]) > 0
+    }
+    return Probe(True, bool(ids), ids, "ok" if ids else "no models listed yet",
+                 max_model_len=lens)
 
 
 def tool_call_smoke(

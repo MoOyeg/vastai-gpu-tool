@@ -342,8 +342,38 @@ linked instance shows up as:
 }
 ```
 
-The model id is read back from the instance's own `/v1/models` rather than
-assumed. The config file is backed up (`opencode.<epoch>.bak`) before every
+The model id **and the context window** are read back from the instance's own
+`/v1/models` rather than assumed. vLLM puts the length it actually booted with on
+each model card, which is the only figure that accounts for what fit on the GPU
+after the KV cache was allocated — it will happily start with less than the
+recipe requested. `gpuctl link` says where the number came from:
+
+```
+linked vast-123 → ~/.config/opencode/opencode.json
+context 131,072 tokens (max output 65,536) — reported by the server
+```
+
+When the server does not say, it is derived rather than defaulted, in this order:
+
+1. **the server's own `max_model_len`** — what actually fit
+2. **the smaller of** the recipe's `--max-model-len` and **what this GPU can hold
+   for this model**: `(VRAM × 0.92 − weights − activations) ÷ KV-bytes-per-token`,
+   halving KV per token when the recipe passes `--kv-cache-dtype fp8`
+3. a conservative 32,768, *labelled as such* so it is not mistaken for a measurement
+
+and the result is capped at the model's architectural maximum. `--max-model-len
+auto` (which `mimo-v2.6-pro` uses) is correctly treated as "no number given"
+rather than silently becoming the default.
+
+The **output** budget is derived too. A reasoning model can spend its entire
+allowance thinking — Qwen3.8 used 100% of a 400-token budget before answering —
+so those get half the context (capped at 64k) against a quarter (capped at 32k)
+for everything else.
+
+This caught a real bug the moment it ran: the `a6000` recipe asked for 28,672
+tokens on a card that holds 48 GiB. After 37.1 GiB of weights there is ~5 GiB of
+KV left, which is ~16.6k tokens at fp16 — so vLLM would have refused to start.
+The recipe now passes `--kv-cache-dtype fp8`, doubling capacity to ~33k. The config file is backed up (`opencode.<epoch>.bak`) before every
 edit, and only providers prefixed `vast-` are ever touched. A config that
 isn't plain JSON is refused rather than rewritten.
 

@@ -833,6 +833,7 @@ def _watch_loop(dep: Deployment, *, interval: float, set_default: bool, reap: bo
                     f"[bold green]opencode configured[/] → provider [bold]{result.provider_id}[/] "
                     f"in {result.path}"
                 )
+                _report_context(dep.instance_id)
                 if result.backup:
                     console.print(f"[dim]backup: {result.backup}[/]")
                 if set_default:
@@ -1040,6 +1041,7 @@ def link(
         snap, config_path=opencode.target_path(config, project), set_default=set_default
     )
     console.print(f"[green]linked[/] {result.provider_id} → {result.path}")
+    _report_context(dep.instance_id)
     if result.backup:
         console.print(f"[dim]backup: {result.backup}[/]")
     if conductor:
@@ -1256,6 +1258,18 @@ def _ensure_conductor_uses_our_opencode(path: Path | None = None) -> None:
         console.print(f"[green]Conductor opencode path[/] → [bold]{binary}[/]"
                       f"[dim]  (was unset, so Conductor used its bundled opencode, "
                       f"which cannot see gpuctl providers)[/]")
+
+
+def _report_context(instance_id: int) -> None:
+    """Say what context window was advertised to opencode, and why."""
+    dep = state.find(instance_id)
+    if not dep or not dep.notes.get("context_len"):
+        return
+    console.print(
+        f"[dim]context[/] [bold]{int(dep.notes['context_len']):,}[/] tokens "
+        f"(max output {int(dep.notes.get('max_output', 0)):,}) "
+        f"[dim]— {dep.notes.get('context_source', '')}[/]"
+    )
 
 
 def _apply_conductor(dep: Deployment) -> None:
